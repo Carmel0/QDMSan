@@ -1,0 +1,21 @@
+{
+  "aflplusplus": {
+    "url": "https://github.com/AFLplusplus/AFLplusplus",
+    "commit": "b449e4c544eaac1a0a9b7d1f2f15d5921907585e"
+  },
+  "qemuafl": {
+    "url": "https://github.com/AFLplusplus/qemuafl",
+    "commit": "60ebd5624c60589e276cf287516b925a9ee35b87"
+  },
+  "qemu_dependencies": {
+    "capstone": "f8b1b833015a4ae47110ed068e0deb7106ced66d",
+    "slirp": "8f43a99191afb47ca3f3c6972f6306209f367ece",
+    "tests/fp/berkeley-softfloat-3": "b64af41c3276f97f0e181920400ee056b9c88037",
+    "tests/fp/berkeley-testfloat-3": "5a59dcec19327396a011a17fd924aed4fec416b3",
+    "ui/keycodemapdb": "6119e6e19a050df847418de7babe5166779955e4"
+  },
+  "layout": "Required QEMU sources are ordinary tracked files, not a private submodule. Other optional upstream gitlinks are not populated.",
+  "snapshot_exclusions": [
+    ".github/workflows"
+  ]
+}
