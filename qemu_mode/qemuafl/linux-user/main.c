@@ -50,6 +50,7 @@
 #include "crypto/init.h"
 
 #include "qemuafl/qasan-qemu.h"
+#include "qemuafl/qdmsan-qemu.h"
 
 char *exec_path;
 
@@ -130,6 +131,7 @@ int cpu_get_pic_interrupt(CPUX86State *env)
 void fork_start(void)
 {
     start_exclusive();
+    if (use_qdmsan) qdmsan_qemu_fork_start();
     mmap_fork_start();
     cpu_list_lock();
 }
@@ -137,6 +139,7 @@ void fork_start(void)
 void fork_end(int child)
 {
     mmap_fork_end(child);
+    if (use_qdmsan) qdmsan_qemu_fork_end(child);
     if (child) {
         CPUState *cpu, *next_cpu;
         /* Child processes created by fork() only have a single thread.
@@ -230,11 +233,12 @@ static inline void ignore_result(long long int unused_result)
     (void) unused_result;
 }
 
-/* Get libqasan path. */
+/* Get QEMU sanitizer preload path. */
 #ifndef AFL_PATH
   #define AFL_PATH "/usr/local/lib/afl/"
 #endif
-static char *get_libqasan_path(char *own_loc)
+static char *get_afl_preload_lib_path(char *own_loc, const char *lib_name,
+                                      const char *doc_name)
 {
     if (!unlikely(own_loc)) {
         fprintf(stderr, "BUG: param own_loc is NULL\n");
@@ -245,9 +249,9 @@ static char *get_libqasan_path(char *own_loc)
 
     tmp = getenv("AFL_PATH");
     if (tmp) {
-        ignore_result(asprintf(&cp, "%s/libqasan.so", tmp));
+        ignore_result(asprintf(&cp, "%s/%s", tmp, lib_name));
         if (access(cp, X_OK)) {
-            fprintf(stderr, "Unable to find '%s'\n", tmp);
+            fprintf(stderr, "Unable to find '%s'\n", cp);
             exit(EXIT_FAILURE);
         }
 
@@ -259,7 +263,7 @@ static char *get_libqasan_path(char *own_loc)
     if (rsl) {
         *rsl = 0;
 
-        ignore_result(asprintf(&cp, "%s/libqasan.so", own_copy));
+        ignore_result(asprintf(&cp, "%s/%s", own_copy, lib_name));
         free(own_copy);
 
         if (!access(cp, X_OK)) { return cp; }
@@ -268,27 +272,42 @@ static char *get_libqasan_path(char *own_loc)
         free(own_copy);
     }
 
-    if (!access(AFL_PATH "/libqasan.so", X_OK)) {
+    char *afl_path_lib = NULL;
+    ignore_result(asprintf(&afl_path_lib, AFL_PATH "/%s", lib_name));
+    if (afl_path_lib && !access(afl_path_lib, X_OK)) {
         if (cp) { free(cp); }
 
-        return strdup(AFL_PATH "/libqasan.so");
+        return afl_path_lib;
     }
+    if (afl_path_lib) { free(afl_path_lib); }
 
     /* This is an AFL error message, but since it is in QEMU it can't
        have all the pretty formatting of AFL without importing
        a bunch of AFL pieces. */
     fprintf(stderr, "\n" "" "[-] " ""
-        "Oops, unable to find the 'libqasan.so' binary. The binary must be "
+        "Oops, unable to find the '%s' binary. The binary must be "
         "built\n"
         "    separately by following the instructions in "
-        "qemu_mode/libqasan/README.md. "
+        "%s. "
         "If you\n"
         "    already have the binary installed, you may need to specify "
         "AFL_PATH in the\n"
-        "    environment.\n");
+        "    environment.\n", lib_name, doc_name);
 
-    fprintf(stderr, "Failed to locate 'libqasan.so'.\n");
+    fprintf(stderr, "Failed to locate '%s'.\n", lib_name);
     exit(EXIT_FAILURE);
+}
+
+static char *get_libqasan_path(char *own_loc)
+{
+    return get_afl_preload_lib_path(own_loc, "libqasan.so",
+                                    "qemu_mode/libqasan/README.md");
+}
+
+static char *get_libqdmsan_path(char *own_loc)
+{
+    return get_afl_preload_lib_path(own_loc, "libqdmsan.so",
+                                    "qemu_mode/libqdmsan/README.md");
 }
 
 static void handle_arg_help(const char *arg)
@@ -702,7 +721,11 @@ int main(int argc, char **argv, char **envp)
     unsigned long max_reserved_va;
 
     use_qasan = !!getenv("AFL_USE_QASAN");
+    use_qdmsan = !!getenv("AFL_USE_QDMSAN");
+    if (use_qdmsan) qdmsan_qemu_init();
 
+    if (getenv("QDMSAN_MAX_CALL_STACK"))
+      qdmsan_max_call_stack = atoi(getenv("QDMSAN_MAX_CALL_STACK"));
     if (getenv("QASAN_MAX_CALL_STACK"))
       qasan_max_call_stack = atoi(getenv("QASAN_MAX_CALL_STACK"));
     if (getenv("QASAN_SYMBOLIZE"))
@@ -747,6 +770,28 @@ int main(int argc, char **argv, char **envp)
             free(afl_preload);
         }
         free(libqasan);
+    }
+
+    if (use_qdmsan) {
+        char *preload = getenv("AFL_PRELOAD");
+        char *libqdmsan = get_libqdmsan_path(argv[0]);
+
+        if (!preload) {
+            setenv("AFL_PRELOAD", libqdmsan, 0);
+        } else if (!strstr(preload, "libqdmsan.so")) {
+            char *afl_preload;
+            if (strchr(preload, ' ')) {
+                ignore_result(asprintf(&afl_preload, "%s %s", libqdmsan,
+                                       preload));
+            } else {
+                ignore_result(asprintf(&afl_preload, "%s:%s", libqdmsan,
+                                       preload));
+            }
+
+            setenv("AFL_PRELOAD", afl_preload, 1);
+            free(afl_preload);
+        }
+        free(libqdmsan);
     }
 
     /* Expand AFL_PRELOAD to append preload libraries */
@@ -936,6 +981,20 @@ int main(int argc, char **argv, char **envp)
         printf("Error while loading %s: %s\n", exec_path, strerror(-ret));
         _exit(EXIT_FAILURE);
     }
+
+    /* QDMSAN records TCG checkpoints only in the main executable by default.
+     * System libc is covered through preload hooks and synthetic syscall
+     * events; recording both libc internals and hook summaries produces
+     * machine-code-specific false positives in routines such as strlen. */
+    if (use_qdmsan) {
+        qdmsan_app_base = info->code_offset;
+        qdmsan_app_start = info->start_code;
+        qdmsan_app_end = info->end_code;
+    }
+    if (use_qdmsan && __qdmsan_qemu_full_map) {
+        __qdmsan_qemu_full_map->meta.module_base = info->code_offset;
+    }
+    (void)use_qdmsan;
 
     for (wrk = target_environ; *wrk; wrk++) {
         g_free(*wrk);

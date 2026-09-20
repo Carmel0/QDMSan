@@ -25,6 +25,7 @@
 #include "qapi/error.h"
 #include "qemu/guest-random.h"
 #include "helper-tcg.h"
+#include "qemuafl/qdmsan-qemu.h"
 
 //#define DEBUG_MULDIV
 
@@ -478,6 +479,11 @@ target_ulong HELPER(rdrand)(CPUX86State *env)
 {
     Error *err = NULL;
     target_ulong ret;
+
+    if (use_qdmsan) {
+        env->cc_src = CC_C;
+        return (target_ulong)qdmsan_fixed_rdrand_next();
+    }
 
     if (qemu_guest_getrandom(&ret, sizeof(ret), &err) < 0) {
         qemu_log_mask(LOG_UNIMP, "rdrand: Crypto failure: %s",

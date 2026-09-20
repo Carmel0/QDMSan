@@ -26,7 +26,7 @@
 /* Version string: */
 
 // c = release, a = volatile github dev, e = experimental branch
-#define VERSION "++4.35a"
+#define VERSION "++4.35c"
 
 /******************************************************
  *                                                    *
@@ -207,6 +207,9 @@
 
 #define KEEP_UNIQUE_HANG 512U
 #define KEEP_UNIQUE_CRASH 25600U
+#define KEEP_UNIQUE_DMSAN 25600U
+#define KEEP_UNIQUE_MSAN_ONLY 25600U
+#define KEEP_UNIQUE_DMSAN_ONLY 25600U
 
 /* Baseline number of random tweaks during a single 'havoc' stage: */
 

@@ -1,0 +1,2134 @@
+--- a/include/afl-fuzz.h
++++ b/include/afl-fuzz.h
+@@ -1628,4 +1628,3 @@
+ #endif
+ 
+ #endif
+-
+--- a/include/asanfuzz.h
++++ b/include/asanfuzz.h
+@@ -54,4 +54,3 @@
+ void sanfuzz_exec_child(struct afl_forkserver *fsrv, char **argv);
+ 
+ #endif
+-
+--- a/include/config.h
++++ b/include/config.h
+@@ -591,4 +591,3 @@
+ #define AFL_TXT_STRING_MAX_MUTATIONS 6
+ 
+ #endif                                                  /* ! _HAVE_CONFIG_H */
+-
+--- a/include/dmsanfuzz.h
++++ b/include/dmsanfuzz.h
+@@ -454,6 +454,9 @@
+ /* Scratch buffer for simplified coverage traces */
+ u8 *dmsan_ensure_trace_scratch(struct afl_state *afl, u32 map_size);
+ 
++/* Write statistics to status screen (called from show_stats) */
++void dmsan_show_stats(struct afl_state *afl);
++
+ /* Cleanup DMSAN resources */
+ void dmsan_deinit(struct afl_state *afl);
+ 
+@@ -487,4 +490,26 @@
+ 
+ }
+ 
++/* Get signal name string */
++static inline const char *dmsan_signal_name(int sig) {
++
++  switch (sig) {
++
++    case 6:
++      return "SIGABRT";
++    case 7:
++      return "SIGBUS";
++    case 8:
++      return "SIGFPE";
++    case 4:
++      return "SIGILL";
++    case 11:
++      return "SIGSEGV";
++    default:
++      return "UNKNOWN";
++
++  }
++
++}
++
+ #endif /* _AFL_DMSANFUZZ_H */
+--- a/include/envs.h
++++ b/include/envs.h
+@@ -116,7 +116,7 @@
+     "AFL_STATSD_PORT", "AFL_STATSD_TAGS_FLAVOR", "AFL_SYNC_TIME",
+     "AFL_TESTCACHE_SIZE", "AFL_TESTCACHE_ENTRIES", "AFL_TMIN_EXACT",
+     "AFL_TMPDIR", "AFL_TOKEN_FILE", "AFL_TRACE_PC", "AFL_USE_ASAN",
+-    /* Keep retired DMSAN names in the allowlist so afl-fuzz can emit
++    /* Keep retired DMSAN names in the allowlist so afl-cc / afl-fuzz can emit
+        explicit migration errors instead of reporting them as unknown typos. */
+     "AFL_DMSAN_MODE", "AFL_DMSAN_DEPLOY",
+     "AFL_DMSAN_AUX_FEEDBACK", "AFL_DMSAN_AUX_CACHE", "AFL_DMSAN_AUX_NONDET",
+@@ -134,15 +134,14 @@
+     "AFL_DMSAN_SITECLASS", "AFL_DMSAN_EXEC",
+     "AFL_DMSAN_L2", "AFL_DMSAN_FEEDBACK",
+     "AFL_QDMSAN_MODE", "AFL_QDMSAN_DEPLOY", "AFL_QDMSAN_CHECK",
+-    "AFL_QDMSAN_PAPER_COMPAT",
+-    "AFL_QDMSAN_STACK_MAX",
+     "AFL_QDMSAN_STACK", "AFL_QDMSAN_CHECK_POINTERS",
+     "AFL_QDMSAN_CHECK_SYSCALLS", "AFL_QDMSAN_CHECK_BRANCHES",
+     "AFL_QDMSAN_CMP_BRANCH_PRUNE", "AFL_QDMSAN_COMPAT_STUBS",
+     "AFL_QDMSAN_FULL_SIZE", "AFL_QDMSAN_HEAP_PLANES",
+     "AFL_QDMSAN_QUARANTINE_MB", "AFL_USE_QDMSAN",
+-    "AFL_USE_MSAN", "AFL_USE_TRACE_PC", "AFL_USE_UBSAN", "AFL_UBSAN_VERBOSE",
+-    "AFL_USE_TSAN", "AFL_USE_CFISAN", "AFL_CFISAN_VERBOSE", "AFL_USE_LSAN",
++    "AFL_USE_MSAN", "AFL_USE_TRACE_PC", "AFL_USE_UBSAN",
++    "AFL_UBSAN_VERBOSE", "AFL_USE_TSAN", "AFL_USE_CFISAN", "AFL_CFISAN_VERBOSE",
++    "AFL_USE_LSAN",
+     "AFL_WINE_PATH", "AFL_NO_SNAPSHOT", "AFL_EXPAND_HAVOC_NOW", "AFL_USE_FASAN",
+     "AFL_USE_QASAN", "AFL_PRINT_FILENAMES", "AFL_PIZZA_MODE",
+     "AFL_NO_FASTRESUME", "AFL_SAN_ABSTRACTION", "AFL_LLVM_ONLY_FSRV",
+@@ -153,4 +152,3 @@
+ extern char *afl_environment_variables[];
+ 
+ #endif
+-
+--- a/instrumentation/SanitizerCoverageLTO.so.cc
++++ b/instrumentation/SanitizerCoverageLTO.so.cc
+@@ -1327,6 +1327,12 @@
+   // (catchswitch blocks).
+   if (BB->getFirstInsertionPt() == BB->end()) return false;
+ 
++  // Skip blocks created by sanitizer instrumentation (e.g. DMSAN checkpoints).
++  // These blocks have !nosanitize on their first non-PHI instruction.
++  if (auto *FirstInst = BB->getFirstNonPHIOrDbgOrLifetime())
++    if (FirstInst->getMetadata("nosanitize"))
++      return false;
++
+   // AFL++ START
+   if (!Options.NoPrune && &F.getEntryBlock() == BB && F.size() > 1)
+     return false;
+@@ -1408,6 +1414,21 @@
+   if (F.getName().startswith("__sanitizer_"))
+ #endif
+     return;  // Don't instrument __sanitizer_* callbacks.
++  // Don't instrument sanitizer runtime functions (DMSAN, MSan, etc.)
++  // These are linked via --whole-archive and would inflate the coverage map.
++  // Covers: ___interceptor_*, __interceptor_trampoline_*, __dmsan_*, __msan_*
++#if LLVM_VERSION_MAJOR >= 18
++  if (F.getName().starts_with("__dmsan_") ||
++      F.getName().starts_with("__msan_") ||
++      F.getName().starts_with("___interceptor") ||
++      F.getName().starts_with("__interceptor_trampoline"))
++#else
++  if (F.getName().startswith("__dmsan_") ||
++      F.getName().startswith("__msan_") ||
++      F.getName().startswith("___interceptor") ||
++      F.getName().startswith("__interceptor_trampoline"))
++#endif
++    return;
+   // Don't touch available_externally functions, their actual body is elsewhere.
+   if (F.getLinkage() == GlobalValue::AvailableExternallyLinkage) return;
+   // Don't instrument MSVC CRT configuration helpers. They may run before normal
+@@ -2421,4 +2442,3 @@
+     PassManagerBuilder::EP_FullLinkTimeOptimizationLast, registerLTOPass);
+   #endif
+ #endif
+-
+--- a/instrumentation/SanitizerCoveragePCGUARD.so.cc
++++ b/instrumentation/SanitizerCoveragePCGUARD.so.cc
+@@ -808,6 +808,12 @@
+   // (catchswitch blocks).
+   if (BB->getFirstInsertionPt() == BB->end()) return false;
+ 
++  // Skip blocks created by sanitizer instrumentation (e.g. DMSAN checkpoints).
++  // These blocks have !nosanitize on their first non-PHI instruction.
++  if (auto *FirstInst = BB->getFirstNonPHIOrDbgOrLifetime())
++    if (FirstInst->getMetadata("nosanitize"))
++      return false;
++
+   if (Options.NoPrune || &F.getEntryBlock() == BB) return true;
+ 
+   // Do not instrument full dominators, or full post-dominators with multiple
+@@ -830,6 +836,19 @@
+   if (F.getName().startswith("__sanitizer_"))
+ #endif
+     return;  // Don't instrument __sanitizer_* callbacks.
++  // Don't instrument sanitizer runtime functions (DMSAN, MSan, etc.)
++#if LLVM_MAJOR >= 18
++  if (F.getName().starts_with("__dmsan_") ||
++      F.getName().starts_with("__msan_") ||
++      F.getName().starts_with("___interceptor") ||
++      F.getName().starts_with("__interceptor_trampoline"))
++#else
++  if (F.getName().startswith("__dmsan_") ||
++      F.getName().startswith("__msan_") ||
++      F.getName().startswith("___interceptor") ||
++      F.getName().startswith("__interceptor_trampoline"))
++#endif
++    return;
+   // Don't touch available_externally functions, their actual body is elewhere.
+   if (F.getLinkage() == GlobalValue::AvailableExternallyLinkage) return;
+   // Don't instrument MSVC CRT configuration helpers. They may run before normal
+@@ -1499,4 +1518,3 @@
+   return "__stop___" + Section;
+ 
+ }
+-
+--- a/instrumentation/afl-compiler-rt.o.c
++++ b/instrumentation/afl-compiler-rt.o.c
+@@ -460,6 +460,7 @@
+   }
+ 
+   char *id_str = getenv(SHM_ENV_VAR);
++  char *cmplog_id_str = getenv(CMPLOG_SHM_ENV_VAR);
+ 
+   if (__afl_final_loc) {
+ 
+@@ -821,7 +822,7 @@
+ 
+   }
+ 
+-  id_str = getenv(CMPLOG_SHM_ENV_VAR);
++  id_str = cmplog_id_str;
+ 
+   if (__afl_debug) {
+ 
+@@ -3522,4 +3523,3 @@
+   }
+ 
+ }
+-
+--- a/qemu_mode/libqdmsan/libqdmsan.c
++++ b/qemu_mode/libqdmsan/libqdmsan.c
+@@ -107,6 +107,7 @@
+ static void (*real_free)(void *);
+ static void *(*real_calloc)(size_t, size_t);
+ static void *(*real_realloc)(void *, size_t);
++static void *(*real_reallocarray)(void *, size_t, size_t);
+ static int (*real_posix_memalign)(void **, size_t, size_t);
+ static void *(*real_memalign)(size_t, size_t);
+ static void *(*real_libc_memalign)(size_t, size_t);
+@@ -359,6 +360,7 @@
+   real_free = dlsym(RTLD_NEXT, "free");
+   real_calloc = dlsym(RTLD_NEXT, "calloc");
+   real_realloc = dlsym(RTLD_NEXT, "realloc");
++  real_reallocarray = dlsym(RTLD_NEXT, "reallocarray");
+   real_posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+   real_memalign = dlsym(RTLD_NEXT, "memalign");
+   real_libc_memalign = dlsym(RTLD_NEXT, "__libc_memalign");
+@@ -735,8 +737,10 @@
+   /* A single selector fills all three vulnerability domains.  Region
+      registration only routes observations; it is not a validity oracle. */
+   qdmsan_poison(raw_ptr, raw_size);
+-  /* Fill the live payload independently of its redzones and alignment.
+-     QEMU chooses the table offset from this user address and size. */
++  /* Preserve the original QDMSan live-payload layout: the poison table starts
++     at offset zero for the user allocation, independently of alignment and
++     the left redzone.  This keeps existing UUM result-mode predicates stable
++     while redzones and freed objects still use the same selector. */
+   qdmsan_poison(user_ptr, size);
+   if (zero_payload && size) memset(user_ptr, 0, size);
+   qdmsan_region_add(raw_ptr, meta->left_redzone_size, QDMSAN_REGION_REDZONE);
+@@ -1625,19 +1629,14 @@
+ void *realloc(void *ptr, size_t size) {
+   int entry_errno = errno;
+   qdmsan_resolve();
+-  int nested = in_qdmsan_hook;
++  if (in_qdmsan_hook) return real_realloc(ptr, size);
+   if (!ptr) {
+     errno = entry_errno;
+     return malloc(size);
+   }
+ 
+-  /* A libc callback can realloc a managed pointer while an outer boundary
+-     wrapper holds the recursion guard.  Inspect ownership in both paths;
+-     managed user pointers are interior pointers, not libc allocations. */
+-  if (!nested) {
+-    in_qdmsan_hook = 1;
+-    qdmsan_suppress_enter();
+-  }
++  in_qdmsan_hook = 1;
++  qdmsan_suppress_enter();
+   size_t old_size = 0;
+   int managed = qdmsan_managed_size(ptr, &old_size);
+   void *new_ptr = NULL;
+@@ -1660,10 +1659,8 @@
+       result_errno = errno;
+     }
+   }
+-  if (!nested) {
+-    qdmsan_suppress_leave();
+-    in_qdmsan_hook = 0;
+-  }
++  qdmsan_suppress_leave();
++  in_qdmsan_hook = 0;
+   errno = result_errno;
+   return new_ptr;
+ }
+@@ -3616,14 +3613,11 @@
+     qdmsan_resolve();
+     return real_clock_gettime ? real_clock_gettime(clk_id, tp) : -1;
+   }
+-  /* Validate the clock without consuming a real timestamp.  getres accepts
+-     NULL and also validates Linux dynamic clock IDs. */
+-  qdmsan_resolve();
+-  if (!real_clock_getres || real_clock_getres(clk_id, NULL) < 0) return -1;
+   if (tp) {
+     tp->tv_sec = qdmsan_fixed_time_sec();
+     tp->tv_nsec = (long)qdmsan_fixed_time_usec() * 1000L;
+   }
++  (void)clk_id;
+   return 0;
+ }
+ 
+@@ -3632,12 +3626,11 @@
+     qdmsan_resolve();
+     return real_clock_getres ? real_clock_getres(clk_id, res) : -1;
+   }
+-  qdmsan_resolve();
+-  if (!real_clock_getres || real_clock_getres(clk_id, NULL) < 0) return -1;
+   if (res) {
+     res->tv_sec = 0;
+     res->tv_nsec = 1;
+   }
++  (void)clk_id;
+   return 0;
+ }
+ 
+@@ -3852,10 +3845,6 @@
+     qdmsan_resolve();
+     return real_getrandom ? real_getrandom(buf, buflen, flags) : -1;
+   }
+-  /* Ask the host to validate flags with a zero-length request; no random
+-     bytes enter the deterministic sequence. */
+-  qdmsan_resolve();
+-  if (!real_getrandom || real_getrandom(NULL, 0, flags) < 0) return -1;
+   if (!buf && buflen) {
+     qdmsan_resolve();
+     return real_getrandom ? real_getrandom(buf, buflen, flags) : -1;
+@@ -3867,10 +3856,6 @@
+   if (in_qdmsan_hook) {
+     qdmsan_resolve();
+     return real_getentropy ? real_getentropy(buf, buflen) : -1;
+-  }
+-  if (buflen > 256) {
+-    errno = EIO;
+-    return -1;
+   }
+   if (!buf && buflen) {
+     qdmsan_resolve();
+--- a/src/afl-cc.c
++++ b/src/afl-cc.c
+@@ -185,7 +185,16 @@
+       have_pic, have_c, shared_linking, partial_linking, non_dash, have_fp,
+       have_flto, have_hidden, have_fortify, have_fcf, have_staticasan,
+       have_rust_asanrt, have_asan, have_msan, have_ubsan, have_lsan, have_tsan,
+-      have_cfisan, have_rtsan;
++      have_cfisan, have_rtsan, have_dmsan;
++
++  /* DMSAN compile-time mode. 0 = unset / not active.
++     1 = fast (S1 only). 2 = fast+aux (S1 + S2.5 site-class bitmap).
++     3 = full (S3 origin trace, fuzz-loop-incompatible by design).
++     Resolved once in aflcc_state_init() from AFL_DMSAN_MODE. */
++  u8 dmsan_mode;
++  /* DMSAN deployment. 0 = sidecar (only-fsrv binary, default),
++     1 = inline (shared coverage+dmsan binary, NoGuard). */
++  u8 dmsan_deploy_inline;
+ 
+   // u8 *march_opt;
+   u8  need_aflpplib;
+@@ -257,9 +266,16 @@
+ /* Insert params into the new argv, make clang load the pass. */
+ static inline void load_llvm_pass(aflcc_state_t *aflcc, u8 *pass) {
+ 
+-  if (getenv("AFL_LLVM_ONLY_FSRV")) {
+-
+-    if (!be_quiet) { DEBUGF("Coverage instrumentation disabled\n"); }
++  if (getenv("AFL_LLVM_ONLY_FSRV") ||
++      (aflcc->have_dmsan && !aflcc->dmsan_deploy_inline)) {
++
++    if (!be_quiet) {
++
++      DEBUGF("Coverage instrumentation disabled%s\n",
++             aflcc->have_dmsan ? " (DMSAN mode)" : "");
++
++    }
++
+     return;
+ 
+   }
+@@ -383,6 +399,68 @@
+   }
+ 
+   if (getenv("AFL_LLVM_NO_ERROR")) { aflcc->wnoerror = 1; }
++
++  /* DMSAN early detection.
++   *
++   * Two compile-time dimensions:
++   *   AFL_DMSAN_MODE  = fast | fast+aux | full (default unset; setting a valid
++   *                     value enables DMSAN)
++   *   AFL_DMSAN_DEPLOY= sidecar | inline             (default sidecar)
++   *
++   * Legacy env vars are no longer accepted. Any of them set -> fatal with a
++   * migration hint so old workflows fail loudly instead of silently
++   * misconfiguring. See docs/dmsan.md.
++   */
++  {
++    static const struct {
++      const char *name;
++      const char *replacement;
++    } kRetiredDmsanEnv[] = {
++        {"AFL_USE_DMSAN", "AFL_DMSAN_MODE=fast"},
++        {"AFL_USE_DMSAN_INLINE",
++         "AFL_DMSAN_MODE=fast AFL_DMSAN_DEPLOY=inline"},
++        {"AFL_USE_DMSAN_FULL", "AFL_DMSAN_MODE=full"},
++        {"AFL_DMSAN_EXEC", "AFL_DMSAN_DEPLOY={sidecar|inline}"},
++        {"AFL_DMSAN_FEEDBACK",
++         "AFL_DMSAN_MODE=fast+aux + runtime AFL_DMSAN_AUX_FEEDBACK=1"},
++        {"AFL_DMSAN_L2", "AFL_DMSAN_MODE=fast+aux + runtime AFL_DMSAN_AUX_CACHE=1"},
++        {"AFL_DMSAN_SITECLASS", "AFL_DMSAN_MODE=fast+aux"},
++    };
++    for (size_t i = 0; i < sizeof(kRetiredDmsanEnv) / sizeof(kRetiredDmsanEnv[0]);
++         ++i) {
++      if (getenv(kRetiredDmsanEnv[i].name)) {
++        FATAL("%s is no longer accepted; use %s (see docs/dmsan.md)",
++              kRetiredDmsanEnv[i].name, kRetiredDmsanEnv[i].replacement);
++      }
++    }
++
++    const char *mode_env = getenv("AFL_DMSAN_MODE");
++    const char *deploy_env = getenv("AFL_DMSAN_DEPLOY");
++
++    if (mode_env) {
++      if (!strcmp(mode_env, "fast"))
++        aflcc->dmsan_mode = 1;
++      else if (!strcmp(mode_env, "fast+aux"))
++        aflcc->dmsan_mode = 2;
++      else if (!strcmp(mode_env, "full"))
++        aflcc->dmsan_mode = 3;
++      else
++        FATAL("Unknown AFL_DMSAN_MODE='%s' (expected fast|fast+aux|full)",
++              mode_env);
++    }
++
++    if (deploy_env) {
++      if (!strcmp(deploy_env, "sidecar"))
++        aflcc->dmsan_deploy_inline = 0;
++      else if (!strcmp(deploy_env, "inline"))
++        aflcc->dmsan_deploy_inline = 1;
++      else
++        FATAL("Unknown AFL_DMSAN_DEPLOY='%s' (expected sidecar|inline)",
++              deploy_env);
++    }
++
++    if (aflcc->dmsan_mode) aflcc->have_dmsan = 1;
++  }
+ 
+   if ((getenv("AFL_PASSTHROUGH") || getenv("AFL_NOOPT")) && (!aflcc->debug)) {
+ 
+@@ -1931,6 +2009,7 @@
+     HAVE_SANITIZER_SCAN_KEEP(tsan, thread);
+     HAVE_SANITIZER_SCAN_KEEP(lsan, leak);
+     HAVE_SANITIZER_SCAN_KEEP(cfisan, cfi);
++    HAVE_SANITIZER_SCAN_KEEP(dmsan, dmsan);
+ 
+   }
+ 
+@@ -2165,6 +2244,56 @@
+ 
+   }
+ 
++  if (aflcc->have_dmsan) {
++
++    if (getenv("AFL_USE_ASAN") || aflcc->have_asan)
++      FATAL("ASAN and DMSAN are mutually exclusive");
++
++    if (getenv("AFL_USE_MSAN") || aflcc->have_msan)
++      FATAL("MSAN and DMSAN are mutually exclusive");
++
++    if (getenv("AFL_HARDEN"))
++      FATAL("DMSAN and AFL_HARDEN are mutually exclusive");
++
++    if (aflcc->dmsan_mode == 3 && aflcc->dmsan_deploy_inline)
++      FATAL("AFL_DMSAN_MODE=full is incompatible with DEPLOY=inline "
++            "(full mode is for offline dmsanfork-diff replay only)");
++
++    add_defs_fortify(aflcc, 0);
++
++    /* MODE=fast+aux enables the S2.5 site-class bitmap. */
++    u8 emit_siteclass = (aflcc->dmsan_mode == 2);
++
++    insert_param(aflcc, "-fsanitize=dmsan");
++
++    if (aflcc->dmsan_mode == 3) {
++      insert_param(aflcc, "-fsanitize-dmsan-track-origins");
++    }
++
++    if (emit_siteclass) {
++      insert_param(aflcc, "-mllvm");
++      insert_param(aflcc, "-dmsan-site-class-map=1");
++    }
++    if (emit_siteclass && aflcc->lto_mode) {
++      insert_param(aflcc, "-mllvm");
++      insert_param(aflcc, "-dmsan-dense-site-ids=1");
++    }
++    if (aflcc->dmsan_deploy_inline) {
++      insert_param(aflcc, "-mllvm");
++      insert_param(aflcc, "-dmsan-no-guard");
++    }
++
++    if (aflcc->debug) {
++      const char *mode_name = (aflcc->dmsan_mode == 3)   ? "full"
++                              : (aflcc->dmsan_mode == 2) ? "fast+aux"
++                                                         : "fast";
++      const char *deploy_name = aflcc->dmsan_deploy_inline ? "inline" : "sidecar";
++      DEBUGF("DMSAN mode=%s deploy=%s%s\n", mode_name, deploy_name,
++             emit_siteclass ? " +s2.5-siteclass" : "");
++    }
++
++  }
++
+ }
+ 
+ /* Add params to enable LLVM SanCov, the native PCGUARD */
+@@ -2177,9 +2306,16 @@
+    * anyway.
+    */
+   if (aflcc->have_rust_asanrt) { return; }
+-  if (getenv("AFL_LLVM_ONLY_FSRV")) {
+-
+-    if (!be_quiet) { DEBUGF("SAND: Coverage instrumentation disabled\n"); }
++  if (getenv("AFL_LLVM_ONLY_FSRV") ||
++      (aflcc->have_dmsan && !aflcc->dmsan_deploy_inline)) {
++
++    if (!be_quiet) {
++
++      DEBUGF("SAND: Coverage instrumentation disabled%s\n",
++             aflcc->have_dmsan ? " (DMSAN mode)" : "");
++
++    }
++
+     return;
+ 
+   }
+@@ -2218,9 +2354,16 @@
+ */
+ void add_optimized_pcguard(aflcc_state_t *aflcc) {
+ 
+-  if (getenv("AFL_LLVM_ONLY_FSRV")) {
+-
+-    if (!be_quiet) { DEBUGF("SAND: Coverage instrumentation disabled\n"); }
++  if (getenv("AFL_LLVM_ONLY_FSRV") ||
++      (aflcc->have_dmsan && !aflcc->dmsan_deploy_inline)) {
++
++    if (!be_quiet) {
++
++      DEBUGF("SAND: Coverage instrumentation disabled%s\n",
++             aflcc->have_dmsan ? " (DMSAN mode)" : "");
++
++    }
++
+     return;
+ 
+   }
+@@ -2489,6 +2632,21 @@
+ 
+ /* Add params to launch SanitizerCoverageLTO.so when linking  */
+ void add_lto_passes(aflcc_state_t *aflcc) {
++
++  /* DMSAN sidecar mode skips SAND coverage instrumentation. */
++  if (getenv("AFL_LLVM_ONLY_FSRV") ||
++      (aflcc->have_dmsan && !aflcc->dmsan_deploy_inline)) {
++
++    if (!be_quiet) {
++
++      DEBUGF("SAND: LTO coverage instrumentation disabled%s\n",
++             aflcc->have_dmsan ? " (DMSAN mode)" : "");
++
++    }
++
++    return;
++
++  }
+ 
+ #if defined(AFL_CLANG_LDPATH) && LLVM_MAJOR >= 15
+   // The NewPM implementation only works fully since LLVM 15.
+@@ -2759,7 +2917,10 @@
+ 
+   if (!getenv("AFL_DONT_OPTIMIZE")) {
+ 
+-    insert_param(aflcc, "-g");
++    if (aflcc->dmsan_mode == 3)
++      insert_param(aflcc, "-g0");
++    else
++      insert_param(aflcc, "-g");
+     if (!aflcc->have_o) insert_param(aflcc, get_opt_level());
+     if (!aflcc->have_unroll) insert_param(aflcc, "-funroll-loops");
+     // if (strlen(aflcc->march_opt) > 1 && aflcc->march_opt[0] == '-')
+@@ -3117,6 +3278,13 @@
+           "  AFL_USE_ASAN: activate address sanitizer\n"
+           "  AFL_USE_CFISAN: activate control flow sanitizer\n"
+           "  AFL_USE_MSAN: activate memory sanitizer\n"
++          "  AFL_DMSAN_MODE=fast|fast+aux|full: differential memory sanitizer "
++          "(default fast). See docs/dmsan.md\n"
++          "  AFL_DMSAN_DEPLOY=sidecar|inline: separate fsrv binary vs shared "
++          "coverage+dmsan binary (default sidecar)\n"
++          "  retired AFL_USE_DMSAN* / AFL_DMSAN_FEEDBACK / AFL_DMSAN_L2 / "
++          "AFL_DMSAN_EXEC / AFL_DMSAN_SITECLASS envs now fatal with migration "
++          "hints\n"
+           "  AFL_USE_UBSAN: activate undefined behaviour sanitizer\n"
+           "  AFL_USE_TSAN: activate thread sanitizer\n"
+           "  AFL_USE_LSAN: activate leak-checker sanitizer\n"
+@@ -3934,4 +4102,3 @@
+   return 0;
+ 
+ }
+-
+--- a/src/afl-forkserver.c
++++ b/src/afl-forkserver.c
+@@ -431,7 +431,6 @@
+ 
+   /* set exceptfds as well to return when a child exited/closed the pipe. */
+ restart_poll:
+-  if (*stop_soon_p) { return 0; }
+   pret = poll(fds, nfds, timeout_ms);
+   if (likely(pret > 0)) {
+ 
+@@ -675,8 +674,6 @@
+   s32   rlen;
+   char *ignore_autodict = getenv("AFL_NO_AUTODICT");
+ 
+-  if (*stop_soon_p) { return; }
+-
+ #ifdef __linux__
+   if (unlikely(fsrv->nyx_mode)) {
+ 
+@@ -1132,10 +1129,6 @@
+     u32 time_ms = read_s32_timed(fsrv->fsrv_st_fd, &status, fsrv->init_tmout,
+                                  stop_soon_p);
+ 
+-    /* A cancelled startup is not a target crash. The caller owns cleanup
+-       and needs the still-recorded forkserver PID to reap/terminate it. */
+-    if (*stop_soon_p) { return; }
+-
+     if (!time_ms) {
+ 
+       s32 tmp_pid = fsrv->fsrv_pid;
+@@ -1168,8 +1161,6 @@
+     rlen = read(fsrv->fsrv_st_fd, &status, 4);
+ 
+   }
+-
+-  if (*stop_soon_p) { return; }
+ 
+   /* If we have a four-byte "hello" message from the server, we're all set.
+      Otherwise, try to figure out what went wrong. */
+--- a/src/afl-fuzz-bitmap.c
++++ b/src/afl-fuzz-bitmap.c
+@@ -649,7 +649,6 @@
+   bool classified = false, bits_counted = false, cksumed = false;
+   u8   new_bits = 0;                       /* valid if bits_counted is true */
+   u64  cksum = 0;                               /* valid if cksumed is true */
+-
+   afl->san_case_status = 0;
+ 
+   /* Update path frequency. */
+@@ -1461,4 +1460,3 @@
+   return keeping;
+ 
+ }
+-
+--- a/src/afl-fuzz-cmplog.c
++++ b/src/afl-fuzz-cmplog.c
+@@ -96,4 +96,3 @@
+   return 0;
+ 
+ }
+-
+--- a/src/afl-fuzz-dmsan.c
++++ b/src/afl-fuzz-dmsan.c
+@@ -2895,6 +2895,53 @@
+ 
+ }
+ 
++/* ========== Statistics Display ========== */
++
++void dmsan_show_stats(afl_state_t *afl) {
++
++  if (!afl->dmsan_enabled) { return; }
++
++  SAYF("    dmsan : checks %llu, bugs %llu, crashes %llu, nondet %llu, timeout %llu\n",
++       (unsigned long long)afl->dmsan_total_checks,
++       (unsigned long long)afl->dmsan_bugs_found,
++       (unsigned long long)afl->dmsan_crashes,
++       (unsigned long long)afl->dmsan_nondets,
++       (unsigned long long)afl->dmsan_timeouts);
++  SAYF("            saved-findings %llu direct %llu probe %llu integrated %llu xchk %llu\n",
++       (unsigned long long)afl->saved_dmsan_findings,
++       (unsigned long long)afl->dmsan_direct_checks,
++       (unsigned long long)afl->dmsan_probe_checks,
++       (unsigned long long)afl->dmsan_integrated_checks,
++       (unsigned long long)afl->dmsan_crosscheck_checks);
++  if (afl->san_binary_length) {
++    SAYF("            msan-only %llu dmsan-only %llu\n",
++         (unsigned long long)afl->saved_msan_only,
++         (unsigned long long)afl->saved_dmsan_only);
++  }
++  if (afl->dmsan_aux_compiled) {
++    SAYF("            aux-novel %llu nondet-stable-inputs %llu polluted-sites %llu rescues %llu\n",
++         (unsigned long long)afl->dmsan_aux_feedback_hits,
++         (unsigned long long)afl->dmsan_nondet_site_inputs,
++         (unsigned long long)afl->dmsan_nondet_site_polluted,
++         (unsigned long long)afl->dmsan_aux_rescues);
++  }
++  SAYF("            clean-cache hits %llu inserts %llu\n",
++       (unsigned long long)afl->dmsan_clean_cache_hits,
++       (unsigned long long)afl->dmsan_clean_cache_inserts);
++  if (afl->dmsan_aux_cache) {
++    SAYF("            aux-cache hits %llu total %llu\n",
++         (unsigned long long)afl->dmsan_aux_cache_hits,
++         (unsigned long long)(afl->dmsan_aux_cache_hits +
++                              afl->dmsan_aux_cache_misses));
++  }
++  if (afl->dmsan_aux_feedback) {
++    SAYF("            probe-runs %llu promotions %llu\n",
++         (unsigned long long)afl->dmsan_probe_runs,
++         (unsigned long long)afl->dmsan_probe_promotions);
++  }
++
++}
++
+ /* ========== Cleanup ========== */
+ 
+ void dmsan_deinit(afl_state_t *afl) {
+--- a/src/afl-fuzz-init.c
++++ b/src/afl-fuzz-init.c
+@@ -3543,4 +3543,3 @@
+   *buf = 0;
+ 
+ }
+-
+--- a/src/afl-fuzz-mutators.c
++++ b/src/afl-fuzz-mutators.c
+@@ -658,4 +658,3 @@
+   return fault;
+ 
+ }
+-
+--- a/src/afl-fuzz-queue.c
++++ b/src/afl-fuzz-queue.c
+@@ -1782,4 +1782,3 @@
+   }
+ 
+ }
+-
+--- a/src/afl-fuzz-run.c
++++ b/src/afl-fuzz-run.c
+@@ -670,9 +670,6 @@
+                         afl->dmsan_cal_reuse_enabled &&
+                         afl->dmsan_shm_fast && afl->dmsan_shm_poison &&
+                         afl->stage_max >= 2 && !afl->dmsan_checking;
+-  const char *paper_compat = getenv("AFL_QDMSAN_PAPER_COMPAT");
+-  u8 qdmsan_isolate_run2 = dmsan_cal_active && afl->qdmsan_enabled &&
+-                           !(paper_compat && !strcmp(paper_compat, "1"));
+   afl->dmsan_cal_have_sigs = 0;
+ 
+   for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max; ++afl->stage_cur) {
+@@ -778,13 +775,6 @@
+     if (unlikely(!q->bitsmap_size)) { q->bitsmap_size = afl->bitsmap_size; }
+ #endif
+ 
+-    /* R2 deliberately changes the fill. Keep its signature for the inline
+-       check, but do not let that controlled change consume virgin coverage
+-       or masquerade as nondeterminism. Later R1 cycles still test stability.
+-       Keep its execution/time in calibration accounting: it was really run.
+-       Compiler DMSan and explicit paper compatibility retain their behavior. */
+-    if (qdmsan_isolate_run2 && afl->stage_cur == 1) { continue; }
+-
+     classify_counts(&afl->fsrv);
+     cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+ 
+@@ -1653,4 +1643,3 @@
+   return 0;
+ 
+ }
+-
+--- a/src/afl-fuzz-state.c
++++ b/src/afl-fuzz-state.c
+@@ -1007,4 +1007,3 @@
+   LIST_FOREACH(&afl_states, afl_state_t, { el->skip_requested = 1; });
+ 
+ }
+-
+--- a/src/afl-fuzz-stats.c
++++ b/src/afl-fuzz-stats.c
+@@ -2683,4 +2683,3 @@
+   *time = cur;
+ 
+ }
+-
+--- a/src/afl-fuzz.c
++++ b/src/afl-fuzz.c
+@@ -4000,4 +4000,3 @@
+ }
+ 
+ #endif                                                          /* !AFL_LIB */
+-
+--- a/utils/qdmsan-diff/qdmsan_diff.c
++++ b/utils/qdmsan-diff/qdmsan_diff.c
+@@ -1,4 +1,12 @@
+-/* Standalone QDMSan replay through the AFL++ forkserver and shared-memory ABI. */
++/*
++   qdmsan-diff - standalone QDMSAN replay helper
++   ------------------------------------------------
++
++   This is intentionally close to LLVM's tools/dmsanfork-diff, but uses the
++   AFL++ forkserver and the current AFL++/DMSAN shared-memory ABI. It rejects
++   the old AFL++ qdmsan branch's private fast-map fields and old full linear
++   record format.
++ */
+ 
+ #define _GNU_SOURCE
+ #define _POSIX_C_SOURCE 200809L
+@@ -12,7 +20,7 @@
+ #include <errno.h>
+ #include <elf.h>
+ #include <fcntl.h>
+-#include <limits.h>
++#include <poll.h>
+ #include <signal.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+@@ -22,7 +30,6 @@
+ #include <sys/stat.h>
+ #include <sys/time.h>
+ #include <sys/types.h>
+-#include <sys/wait.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
+@@ -30,7 +37,6 @@
+ #define QDMSAN_DIFF_DEFAULT_REPORT_LIMIT 8
+ 
+ static qdmsan_diff_ctx_t *cleanup_ctx;
+-static volatile sig_atomic_t interrupted_signal;
+ 
+ static int ascii_lower(int c) {
+ 
+@@ -55,37 +61,8 @@
+ 
+ static void signal_cleanup(int sig) {
+ 
+-  int saved_errno = errno;
+-  interrupted_signal = sig;
+-  if (cleanup_ctx) {
+-    cleanup_ctx->stop_soon = 1;
+-    /* kill is async-signal-safe and wakes a blocked forkserver read. All
+-       deallocation and shared-memory cleanup runs in normal control flow. */
+-    if (cleanup_ctx->fsrv.child_pid > 0) {
+-      kill(cleanup_ctx->fsrv.child_pid, SIGKILL);
+-    }
+-    if (cleanup_ctx->fsrv.fsrv_pid > 0) {
+-      kill(cleanup_ctx->fsrv.fsrv_pid, SIGKILL);
+-    }
+-  }
+-  errno = saved_errno;
+-
+-}
+-
+-static void cleanup_at_exit(void) {
+-
+-  qdmsan_diff_ctx_t *ctx = cleanup_ctx;
+-  cleanup_ctx = NULL;
+-  if (ctx) { qdmsan_diff_cleanup(ctx); }
+-  /* A signal can arrive inside a shared AFL helper that exits on an I/O
+-     failure. Preserve cancellation status after normal cleanup in that race. */
+-  if (interrupted_signal) { _exit(128 + interrupted_signal); }
+-
+-}
+-
+-static void check_interrupted(void) {
+-
+-  if (interrupted_signal) { exit(128 + interrupted_signal); }
++  if (cleanup_ctx) { qdmsan_diff_cleanup(cleanup_ctx); }
++  _exit(128 + sig);
+ 
+ }
+ 
+@@ -150,10 +127,9 @@
+           "  -m <mode>       fast | fast+aux | full (default: fast)\n"
+           "  -c <check>      raw | result (default: raw)\n"
+           "  -i <file>       replay file for stdin or @@\n"
+-          "  -t <ms>         timeout per run, 1..536870911 ms (default: 5000)\n"
+-          "  -C <n>          extra fast-mode diagnostic triplets, 0..1000 (default: 0)\n"
++          "  -t <ms>         timeout per run (default: 5000)\n"
++          "  -C <n>          extra fast-mode diagnostic triplets (default: 0)\n"
+           "  -R <n>          full-mode report limit (default: 8)\n"
+-          "  -S              state oracle (compare AFL edge hit-count buckets)\n"
+           "  -v              verbose\n"
+           "  -Q              quiet result output\n"
+           "  -h              show this help\n"
+@@ -163,27 +139,6 @@
+ 
+ }
+ 
+-static u32 parse_u32(const char *name, const char *value, u32 minimum,
+-                     u32 maximum) {
+-
+-  if (!value || !*value) { die_usage("%s requires an integer", name); }
+-  for (const char *p = value; *p; ++p) {
+-    if (*p < '0' || *p > '9') {
+-      die_usage("%s requires a decimal integer in [%u, %u]", name, minimum,
+-                maximum);
+-    }
+-  }
+-  errno = 0;
+-  char *end = NULL;
+-  unsigned long long number = strtoull(value, &end, 10);
+-  if (errno || !end || *end || number < minimum || number > maximum) {
+-    die_usage("%s requires a decimal integer in [%u, %u]", name, minimum,
+-              maximum);
+-  }
+-  return (u32)number;
+-
+-}
+-
+ static u8 parse_bool_off(const char *value) {
+ 
+   return value && (!strcmp(value, "0") || !strcmp(value, "off") ||
+@@ -205,8 +160,7 @@
+   errno = 0;
+   char *end = NULL;
+   unsigned long long parsed = strtoull(value, &end, 0);
+-  if (errno || !end || end == value || *end ||
+-      value[0] < '0' || value[0] > '9') {
++  if (errno || !end || *end) {
+     fprintf(stderr, "qdmsan-diff: ignoring invalid %s='%s'\n", name, value);
+     return 0;
+   }
+@@ -431,27 +385,15 @@
+ 
+   for (;;) {
+ 
+-    check_interrupted();
+     ssize_t got = read(in_fd, tmp, sizeof(tmp));
+-    check_interrupted();
+     if (!got) { break; }
+-    if (got < 0) {
+-      if (errno == EINTR) { continue; }
+-      PFATAL("read input failed");
+-    }
+-    if ((size_t)got > UINT32_MAX - len) {
+-      FATAL("input exceeds the forkserver's 32-bit length limit");
+-    }
++    if (got < 0) { PFATAL("read input failed"); }
+ 
+     if (out_fd >= 0) {
+       ssize_t off = 0;
+       while (off < got) {
+         ssize_t wrote = write(out_fd, tmp + off, (size_t)(got - off));
+-        if (wrote < 0) {
+-          if (errno == EINTR) { check_interrupted(); continue; }
+-          PFATAL("write input snapshot failed");
+-        }
+-        if (!wrote) { FATAL("short write to input snapshot"); }
++        if (wrote < 0) { PFATAL("write input snapshot failed"); }
+         off += wrote;
+       }
+     }
+@@ -490,8 +432,12 @@
+ 
+   if (S_ISCHR(st.st_mode) && isatty(STDIN_FILENO)) { return; }
+ 
+-  /* A pipe is an input stream, even when its writer has not produced the
+-     first byte yet. Read until EOF so every replay sees the whole input. */
++  if (!S_ISREG(st.st_mode)) {
++    struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
++    int           pr = poll(&pfd, 1, 0);
++    if (pr <= 0 || !(pfd.revents & (POLLIN | POLLHUP))) { return; }
++  }
++
+   copy_all(-1, STDIN_FILENO, &ctx->input_buf, &ctx->input_len);
+ 
+ }
+@@ -596,47 +542,21 @@
+ 
+ }
+ 
+-static int same_file(const char *left, const char *right) {
+-
+-  struct stat a, b;
+-  return !strcmp(left, right) ||
+-         (!stat(left, &a) && !stat(right, &b) &&
+-          a.st_dev == b.st_dev && a.st_ino == b.st_ino);
+-
+-}
+-
+ static void prepend_afl_preload(const char *path) {
+ 
+   if (!path || !*path) { return; }
+-  if (strpbrk(path, ": \t\n")) {
+-    die_usage("libqdmsan path contains an unsupported preload separator: %s",
+-              path);
+-  }
+ 
+   const char *old = getenv("AFL_PRELOAD");
+-  char *joined = xstrdup0(path);
+-  char *entries = xstrdup0(old ? old : "");
+-  char *save = NULL;
+-  for (char *entry = strtok_r(entries, ": \t\n", &save); entry;
+-       entry = strtok_r(NULL, ": \t\n", &save)) {
+-    if (same_file(path, entry)) { continue; }
+-    const char *base = strrchr(entry, '/');
+-    base = base ? base + 1 : entry;
+-    if (!strcmp(base, "libqdmsan.so") ||
+-        !strncmp(base, "libqdmsan.so.", strlen("libqdmsan.so."))) {
+-      die_usage("AFL_PRELOAD runtime '%s' conflicts with selected runtime '%s'; "
+-                "remove the conflicting entry", entry, path);
+-    }
+-    char *next = NULL;
+-    if (asprintf(&next, "%s:%s", joined, entry) < 0) {
+-      PFATAL("asprintf failed");
+-    }
++  if (old && strstr(old, "libqdmsan.so")) { return; }
++
++  if (old && *old) {
++    char *joined = NULL;
++    if (asprintf(&joined, "%s:%s", path, old) < 0) { PFATAL("asprintf failed"); }
++    setenv("AFL_PRELOAD", joined, 1);
+     free(joined);
+-    joined = next;
+-  }
+-  if (setenv("AFL_PRELOAD", joined, 1)) { PFATAL("setenv AFL_PRELOAD failed"); }
+-  free(entries);
+-  free(joined);
++  } else {
++    setenv("AFL_PRELOAD", path, 1);
++  }
+ 
+ }
+ 
+@@ -654,6 +574,8 @@
+   snprintf(seed, sizeof(seed), "%llu",
+            (unsigned long long)(ctx->fixed_rand_base & 0x7fffffffULL));
+   if (!getenv("QEMU_RAND_SEED")) { setenv("QEMU_RAND_SEED", seed, 1); }
++
++  if (ctx->libqdmsan_path) { prepend_afl_preload(ctx->libqdmsan_path); }
+ 
+   execv((const char *)fsrv->target_path, argv);
+   _exit(1);
+@@ -692,8 +614,10 @@
+   if (ctx->mode == QDMSAN_DIFF_MODE_FULL) {
+     const char *size_env = getenv("AFL_QDMSAN_FULL_SIZE");
+     if (size_env && *size_env) {
+-      ctx->full_entries = parse_u32("AFL_QDMSAN_FULL_SIZE", size_env,
+-                                    DMSAN_FULL_MIN_SIZE, DMSAN_FULL_MAX_SIZE);
++      errno = 0;
++      char *end = NULL;
++      unsigned long parsed = strtoul(size_env, &end, 10);
++      if (!errno && end && !*end && parsed) { ctx->full_entries = parsed; }
+     }
+     if (ctx->full_entries < DMSAN_FULL_MIN_SIZE) {
+       ctx->full_entries = DMSAN_FULL_MIN_SIZE;
+@@ -766,11 +690,6 @@
+       run == 1 ? &ctx->snap1 : run == 2 ? &ctx->snap2 : &ctx->snap3;
+   memcpy(fast_dst, ctx->fast_map, sizeof(*fast_dst));
+ 
+-  if (ctx->state_oracle && ctx->trace_bits) {
+-    u8 *cov_dst = run == 1 ? ctx->cov1 : run == 2 ? ctx->cov2 : ctx->cov3;
+-    if (cov_dst) { memcpy(cov_dst, ctx->trace_bits, MAP_SIZE); }
+-  }
+-
+   if (ctx->feedback_map) {
+     u16 *aux_dst = run == 1 ? ctx->aux1 : run == 2 ? ctx->aux2 : ctx->aux3;
+     memcpy(aux_dst, ctx->feedback_map->site_map,
+@@ -794,20 +713,13 @@
+ static qdmsan_diff_result_t run_one(qdmsan_diff_ctx_t *ctx, u8 poison,
+                                     struct dmsan_fast_map *snap, u16 *aux) {
+ 
+-  check_interrupted();
+   *ctx->poison_byte = poison;
+   clear_maps(ctx);
+-  /* The coverage map carries hit counts forward between runs here, so the
+-     state oracle clears it itself and each snapshot holds one run. */
+-  if (ctx->state_oracle && ctx->trace_bits) {
+-    memset(ctx->trace_bits, 0, MAP_SIZE);
+-  }
+   write_replay_input(ctx);
+ 
+   fsrv_run_result_t ret =
+       afl_fsrv_run_target(&ctx->fsrv, ctx->timeout_ms, &ctx->stop_soon);
+   ++ctx->total_runs;
+-  check_interrupted();
+ 
+   if (ret == FSRV_RUN_OK) {
+     if (snap) { memcpy(snap, ctx->fast_map, sizeof(*snap)); }
+@@ -848,60 +760,6 @@
+ 
+ }
+ 
+-/* Coarse state oracle. The two fills and the repeat run are the same ones the
+-   checkpoint oracle uses, so only the compared quantity changes. An edge whose
+-   hit bucket moves with the fill and returns on the repeat marks a poison
+-   dependent divergence, while an edge that differs between the two runs that
+-   share a fill marks execution noise. */
+-/* AFL hit count bucketing. Comparing raw counters would call a loop that runs
+-   a few more times a divergence, so the state oracle compares the same
+-   bucketed classes a coverage guided fuzzer stores. */
+-static u8 cov_bucket(u8 v) {
+-
+-  if (v == 0) { return 0; }
+-  if (v == 1) { return 1; }
+-  if (v == 2) { return 2; }
+-  if (v == 3) { return 4; }
+-  if (v <= 7) { return 8; }
+-  if (v <= 15) { return 16; }
+-  if (v <= 31) { return 32; }
+-  if (v <= 127) { return 64; }
+-  return 128;
+-
+-}
+-
+-static qdmsan_diff_result_t cov_maps_verdict(const qdmsan_diff_ctx_t *ctx,
+-                                             const u8 *m1, const u8 *m2,
+-                                             const u8 *m3) {
+-
+-  if (!m1 || !m2 || !m3) { return QDMSAN_DIFF_CLEAN; }
+-
+-  u8  any_nondet = 0;
+-  u32 live = 0, diff_fill = 0, diff_repeat = 0;
+-
+-  for (u32 i = 0; i < MAP_SIZE; ++i) {
+-    u8 v1 = cov_bucket(m1[i]);
+-    u8 v2 = cov_bucket(m2[i]);
+-    u8 v3 = cov_bucket(m3[i]);
+-    if (!(v1 | v2 | v3)) { continue; }
+-    ++live;
+-    if (v1 != v2) { ++diff_fill; }
+-    if (v1 != v3) {
+-      ++diff_repeat;
+-      any_nondet = 1;
+-    }
+-  }
+-
+-  if (ctx && ctx->verbose) {
+-    printf("  state: live=%u fill_diff=%u repeat_diff=%u\n", live, diff_fill,
+-           diff_repeat);
+-  }
+-
+-  if (!any_nondet && diff_fill) { return QDMSAN_DIFF_BUG; }
+-  return any_nondet ? QDMSAN_DIFF_NONDET : QDMSAN_DIFF_CLEAN;
+-
+-}
+-
+ static qdmsan_diff_result_t aux_maps_verdict(const u16 *m1, const u16 *m2,
+                                              const u16 *m3) {
+ 
+@@ -1093,18 +951,12 @@
+   r = run_and_save(ctx, 2, DMSAN_POISON_RUN2);
+   if (r != QDMSAN_DIFF_CLEAN) { return r; }
+ 
+-  /* The state oracle needs the repeat run even when the digests agree, since
+-     its verdict comes from coverage rather than from those digests. */
+-  if (!ctx->state_oracle && signatures_equal(&ctx->snap1, &ctx->snap2)) {
++  if (signatures_equal(&ctx->snap1, &ctx->snap2)) {
+     return QDMSAN_DIFF_CLEAN;
+   }
+ 
+   r = run_and_save(ctx, 3, DMSAN_POISON_RUN3);
+   if (r != QDMSAN_DIFF_CLEAN) { return r; }
+-
+-  if (ctx->state_oracle) {
+-    return cov_maps_verdict(ctx, ctx->cov1, ctx->cov2, ctx->cov3);
+-  }
+ 
+   /* The three fast-map planes are the online oracle in every mode. Full mode
+      additionally populates localization statistics but cannot hide a pure
+@@ -1219,54 +1071,34 @@
+ 
+ }
+ 
+-static int resolve_with_tool(const char *tool, const char *target, u64 addr,
+-                             char *buf, size_t buflen) {
+-
+-  int fds[2];
+-  if (pipe(fds)) { return 0; }
+-  char address[32];
+-  snprintf(address, sizeof(address), "0x%llx", (unsigned long long)addr);
+-  pid_t pid = fork();
+-  if (pid < 0) { close(fds[0]); close(fds[1]); return 0; }
+-  if (!pid) {
+-    close(fds[0]);
+-    if (dup2(fds[1], STDOUT_FILENO) < 0) { _exit(127); }
+-    close(fds[1]);
+-    int nullfd = open("/dev/null", O_WRONLY);
+-    if (nullfd >= 0) { dup2(nullfd, STDERR_FILENO); close(nullfd); }
+-    char *const args[] = {(char *)tool, "-f", "-C", "-e", (char *)target,
+-                         address, NULL};
+-    execvp(tool, args);
+-    _exit(127);
+-  }
+-  close(fds[1]);
+-  FILE *fp = fdopen(fds[0], "r");
+-  char func[256] = {0}, loc[512] = {0};
+-  int parsed = fp && fgets(func, sizeof(func), fp) && fgets(loc, sizeof(loc), fp);
+-  if (fp) { fclose(fp); } else { close(fds[0]); }
+-  int status = 0;
+-  pid_t waited;
+-  do {
+-    if (interrupted_signal) { kill(pid, SIGKILL); }
+-    waited = waitpid(pid, &status, 0);
+-  } while (waited < 0 && errno == EINTR);
+-  check_interrupted();
+-  if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) || !parsed) {
++static int resolve_addr(const char *target, u64 addr, char *buf, size_t buflen) {
++
++  if (!target || !addr || !buflen) { return 0; }
++
++  char cmd[1024];
++  snprintf(cmd, sizeof(cmd),
++           "llvm-addr2line -f -C -e '%s' 0x%llx 2>/dev/null || "
++           "addr2line -f -C -e '%s' 0x%llx 2>/dev/null",
++           target, (unsigned long long)addr, target,
++           (unsigned long long)addr);
++
++  FILE *fp = popen(cmd, "r");
++  if (!fp) { return 0; }
++
++  char func[256] = {0};
++  char loc[512] = {0};
++  if (!fgets(func, sizeof(func), fp) || !fgets(loc, sizeof(loc), fp)) {
++    pclose(fp);
+     return 0;
+   }
++  pclose(fp);
++
+   func[strcspn(func, "\r\n")] = '\0';
+   loc[strcspn(loc, "\r\n")] = '\0';
+   if (func[0] == '?' || loc[0] == '?') { return 0; }
++
+   snprintf(buf, buflen, "%s @ %s", func, loc);
+   return 1;
+-
+-}
+-
+-static int resolve_addr(const char *target, u64 addr, char *buf, size_t buflen) {
+-
+-  if (!target || !addr || !buflen) { return 0; }
+-  return resolve_with_tool("llvm-addr2line", target, addr, buf, buflen) ||
+-         resolve_with_tool("addr2line", target, addr, buf, buflen);
+ 
+ }
+ 
+@@ -1344,20 +1176,19 @@
+   if (ctx->quiet) { return; }
+ 
+   printf("[%s] mode=%s check=%s runs=%llu candidate=%s(0x%02x) "
+-         "confirmed=%s(0x%02x) nondet=%s(0x%02x) oracle=%s\n",
++         "confirmed=%s(0x%02x) nondet=%s(0x%02x)\n",
+          qdmsan_diff_result_name(result), qdmsan_diff_mode_name(ctx->mode),
+          qdmsan_diff_check_name(ctx->check),
+          (unsigned long long)ctx->total_runs,
+          plane_mask_name(ctx->candidate_mask), ctx->candidate_mask,
+          plane_mask_name(ctx->confirmed_mask), ctx->confirmed_mask,
+-         plane_mask_name(ctx->nondet_mask), ctx->nondet_mask,
+-         ctx->state_oracle ? "state" : "consumption");
++         plane_mask_name(ctx->nondet_mask), ctx->nondet_mask);
+ 
+   if (ctx->verbose || result == QDMSAN_DIFF_BUG ||
+       result == QDMSAN_DIFF_NONDET) {
+     print_signature("run1", &ctx->snap1);
+     print_signature("run2", &ctx->snap2);
+-    if (!signatures_equal(&ctx->snap1, &ctx->snap2) || ctx->state_oracle ||
++    if (!signatures_equal(&ctx->snap1, &ctx->snap2) ||
+         ctx->mode == QDMSAN_DIFF_MODE_FULL) {
+       print_signature("run3", &ctx->snap3);
+     }
+@@ -1382,18 +1213,11 @@
+ static void setup_forkserver(qdmsan_diff_ctx_t *ctx, const char *input_file) {
+ 
+   afl_fsrv_init(&ctx->fsrv);
+-  ctx->fsrv_started = 1;
+   ctx->trace_bits =
+       afl_shm_init(&ctx->afl_shm, MAP_SIZE, 0, DEFAULT_PERMISSION, -1);
+   if (!ctx->trace_bits) { PFATAL("AFL shared memory init failed"); }
+ 
+   ctx->fsrv.trace_bits = ctx->trace_bits;
+-
+-  if (ctx->state_oracle) {
+-    ctx->cov1 = ck_alloc(MAP_SIZE);
+-    ctx->cov2 = ck_alloc(MAP_SIZE);
+-    ctx->cov3 = ck_alloc(MAP_SIZE);
+-  }
+   ctx->fsrv.map_size = MAP_SIZE;
+   ctx->fsrv.real_map_size = MAP_SIZE;
+   ctx->fsrv.target_path = (u8 *)ctx->qemu_path;
+@@ -1406,14 +1230,12 @@
+   ctx->fsrv.debug = false;
+ 
+   setup_input(ctx, input_file);
+-  check_interrupted();
+   ctx->exec_argv = build_exec_argv(ctx);
+ 
+   be_quiet = 1;
+   write_replay_input(ctx);
+-  check_interrupted();
+   afl_fsrv_start(&ctx->fsrv, ctx->exec_argv, &ctx->stop_soon, 0);
+-  check_interrupted();
++  ctx->fsrv_started = 1;
+ 
+ }
+ 
+@@ -1439,10 +1261,6 @@
+     afl_shm_deinit(&ctx->afl_shm);
+     ctx->trace_bits = NULL;
+   }
+-
+-  if (ctx->cov1) { ck_free(ctx->cov1); ctx->cov1 = NULL; }
+-  if (ctx->cov2) { ck_free(ctx->cov2); ctx->cov2 = NULL; }
+-  if (ctx->cov3) { ck_free(ctx->cov3); ctx->cov3 = NULL; }
+ 
+   if (ctx->input_fd >= 0) {
+     close(ctx->input_fd);
+@@ -1534,7 +1352,7 @@
+ 
+ int main(int argc, char **argv) {
+ 
+-  static qdmsan_diff_ctx_t ctx;
++  qdmsan_diff_ctx_t ctx;
+   memset(&ctx, 0, sizeof(ctx));
+   ctx.input_fd = -1;
+   ctx.shm_fast_id = -1;
+@@ -1548,14 +1366,13 @@
+   ctx.mode = parse_mode(getenv("AFL_QDMSAN_MODE"));
+   ctx.check = parse_check(getenv("AFL_QDMSAN_CHECK"));
+   if (getenv("AFL_DMSAN_CONFIRM_RUNS")) {
+-    ctx.confirm_runs = parse_u32("AFL_DMSAN_CONFIRM_RUNS",
+-                                 getenv("AFL_DMSAN_CONFIRM_RUNS"), 0, 1000);
++    ctx.confirm_runs = (u32)atoi(getenv("AFL_DMSAN_CONFIRM_RUNS"));
+   }
+ 
+   const char *input_file = NULL;
+ 
+   int opt;
+-  while ((opt = getopt(argc, argv, "+q:l:m:c:i:t:C:R:SvQh")) != -1) {
++  while ((opt = getopt(argc, argv, "+q:l:m:c:i:t:C:R:vQh")) != -1) {
+     switch (opt) {
+       case 'q':
+         ctx.qemu_path = xstrdup0(optarg);
+@@ -1573,16 +1390,13 @@
+         input_file = optarg;
+         break;
+       case 't':
+-        ctx.timeout_ms = parse_u32("-t", optarg, 1, INT_MAX / 4);
++        ctx.timeout_ms = (u32)strtoul(optarg, NULL, 10);
+         break;
+       case 'C':
+-        ctx.confirm_runs = parse_u32("-C", optarg, 0, 1000);
++        ctx.confirm_runs = (u32)strtoul(optarg, NULL, 10);
+         break;
+       case 'R':
+-        ctx.report_limit = parse_u32("-R", optarg, 0, UINT32_MAX);
+-        break;
+-      case 'S':
+-        ctx.state_oracle = 1;
++        ctx.report_limit = (u32)strtoul(optarg, NULL, 10);
+         break;
+       case 'v':
+         ctx.verbose = 1;
+@@ -1617,29 +1431,25 @@
+     die_usage("libqdmsan path is not readable: %s", ctx.libqdmsan_path);
+   }
+   if (!ctx.libqdmsan_path) { ctx.libqdmsan_path = find_libqdmsan_path(); }
+-  if (ctx.libqdmsan_path) { prepend_afl_preload(ctx.libqdmsan_path); }
+ 
+   if (parse_bool_off(getenv("AFL_QDMSAN_STACK"))) {
+     if (ctx.verbose) { fprintf(stderr, "qdmsan-diff: stack poisoning disabled\n"); }
+   }
+ 
+   cleanup_ctx = &ctx;
+-  if (atexit(cleanup_at_exit)) { PFATAL("atexit failed"); }
+-  struct sigaction action = {0};
+-  action.sa_handler = signal_cleanup;
+-  sigemptyset(&action.sa_mask);
+-  sigaction(SIGINT, &action, NULL);
+-  sigaction(SIGTERM, &action, NULL);
++  signal(SIGINT, signal_cleanup);
++  signal(SIGTERM, signal_cleanup);
+   signal(SIGPIPE, SIG_IGN);
+ 
+   if (qdmsan_diff_init(&ctx) != 0) {
++    qdmsan_diff_cleanup(&ctx);
+     return QDMSAN_DIFF_ERROR;
+   }
+ 
+   setup_forkserver(&ctx, input_file);
+   qdmsan_diff_result_t result = qdmsan_diff_check(&ctx);
+   qdmsan_diff_report(&ctx, result);
+-  check_interrupted();
++  qdmsan_diff_cleanup(&ctx);
+   return (int)result;
+ 
+ }
+--- a/utils/qdmsan-diff/qdmsan_diff.h
++++ b/utils/qdmsan-diff/qdmsan_diff.h
+@@ -98,13 +98,6 @@
+   struct dmsan_fast_map snap2;
+   struct dmsan_fast_map snap3;
+ 
+-  /* Coarse state oracle. Same poisoning and same three runs, but the verdict
+-     compares AFL edge hit-count buckets instead of checkpoint digests. */
+-  u8 state_oracle;
+-  u8 *cov1;
+-  u8 *cov2;
+-  u8 *cov3;
+-
+   u16 *aux1;
+   u16 *aux2;
+   u16 *aux3;
+--- a/qemu_mode/qemuafl/accel/tcg/tcg-runtime.c
++++ b/qemu_mode/qemuafl/accel/tcg/tcg-runtime.c
+@@ -506,19 +506,6 @@
+ __thread int qdmsan_recording_suppressed = 0;
+ static pthread_key_t qdmsan_flush_key;
+ static pthread_once_t qdmsan_flush_key_once = PTHREAD_ONCE_INIT;
+-/* Checkpoints update TLS without locks.  QEMU exclusive sections quiesce
+- * those writers before a process-wide drain.  Syscall-side recording and
+- * thread removal use this lock because they run outside cpu_exec(). */
+-struct qdmsan_thread_accumulators {
+-  uint64_t *lanes[9];
+-  struct qdmsan_thread_accumulators *next;
+-  bool registered;
+-};
+-static __thread struct qdmsan_thread_accumulators qdmsan_thread_acc;
+-static struct qdmsan_thread_accumulators *qdmsan_threads;
+-static pthread_mutex_t qdmsan_threads_lock = PTHREAD_MUTEX_INITIALIZER;
+-static bool qdmsan_process_exiting;
+-static bool qdmsan_paper_compat;
+ static _Atomic uint64_t qdmsan_fixed_time_counter;
+ static _Atomic uint64_t qdmsan_fixed_rand_counter;
+ static _Atomic uint64_t qdmsan_fixed_tsc_counter;
+@@ -1321,84 +1308,59 @@
+   fclose(out);
+ }
+ 
+-/* Caller owns this thread, or has stopped TCG execution and holds the
+- * registry lock.  Zero after publication so thread exit cannot add twice. */
+-static void qdmsan_flush_accumulators(struct qdmsan_thread_accumulators *acc) {
+-  if (!__qdmsan_qemu_map || !acc->registered) return;
+-  uint64_t *dest[9] = {
+-      &__qdmsan_qemu_map->sum_signature,
+-      &__qdmsan_qemu_map->rotl_signature,
+-      &__qdmsan_qemu_map->total_count,
+-      &__qdmsan_qemu_map->padding[QDMSAN_OOB_SUM_LANE],
+-      &__qdmsan_qemu_map->padding[QDMSAN_OOB_ROTL_LANE],
+-      &__qdmsan_qemu_map->padding[QDMSAN_OOB_COUNT_LANE],
+-      &__qdmsan_qemu_map->padding[QDMSAN_UAF_SUM_LANE],
+-      &__qdmsan_qemu_map->padding[QDMSAN_UAF_ROTL_LANE],
+-      &__qdmsan_qemu_map->padding[QDMSAN_UAF_COUNT_LANE]};
+-  for (unsigned plane = 0; plane < 9; plane += 3) {
+-    if (*acc->lanes[plane + 2]) {
+-      for (unsigned i = plane; i < plane + 3; ++i) {
+-        atomic_fetch_add((_Atomic uint64_t *)dest[i], *acc->lanes[i]);
+-        *acc->lanes[i] = 0;
+-      }
+-    }
++static inline void qdmsan_qemu_flush_tls(void) {
++  if (!__qdmsan_qemu_map) return;
++
++  if (__qdmsan_qemu_cnt) {
++    atomic_fetch_add((_Atomic uint64_t *)&__qdmsan_qemu_map->sum_signature,
++                     __qdmsan_qemu_h1);
++    atomic_fetch_add((_Atomic uint64_t *)&__qdmsan_qemu_map->rotl_signature,
++                     __qdmsan_qemu_h2);
++    atomic_fetch_add((_Atomic uint64_t *)&__qdmsan_qemu_map->total_count,
++                     __qdmsan_qemu_cnt);
++    __qdmsan_qemu_h1 = __qdmsan_qemu_h2 = __qdmsan_qemu_cnt = 0;
++  }
++
++  if (qdmsan_oob_cnt) {
++    atomic_fetch_add((_Atomic uint64_t *)&__qdmsan_qemu_map
++                         ->padding[QDMSAN_OOB_SUM_LANE],
++                     qdmsan_oob_h1);
++    atomic_fetch_add((_Atomic uint64_t *)&__qdmsan_qemu_map
++                         ->padding[QDMSAN_OOB_ROTL_LANE],
++                     qdmsan_oob_h2);
++    atomic_fetch_add((_Atomic uint64_t *)&__qdmsan_qemu_map
++                         ->padding[QDMSAN_OOB_COUNT_LANE],
++                     qdmsan_oob_cnt);
++    qdmsan_oob_h1 = qdmsan_oob_h2 = qdmsan_oob_cnt = 0;
++  }
++
++  if (qdmsan_uaf_cnt) {
++    atomic_fetch_add((_Atomic uint64_t *)&__qdmsan_qemu_map
++                         ->padding[QDMSAN_UAF_SUM_LANE],
++                     qdmsan_uaf_h1);
++    atomic_fetch_add((_Atomic uint64_t *)&__qdmsan_qemu_map
++                         ->padding[QDMSAN_UAF_ROTL_LANE],
++                     qdmsan_uaf_h2);
++    atomic_fetch_add((_Atomic uint64_t *)&__qdmsan_qemu_map
++                         ->padding[QDMSAN_UAF_COUNT_LANE],
++                     qdmsan_uaf_cnt);
++    qdmsan_uaf_h1 = qdmsan_uaf_h2 = qdmsan_uaf_cnt = 0;
+   }
+ }
+ 
+ static void qdmsan_thread_flush_destructor(void *value) {
+-  struct qdmsan_thread_accumulators *acc = value;
+-  if (!acc) return;
+-  pthread_mutex_lock(&qdmsan_threads_lock);
+-  qdmsan_flush_accumulators(acc);
+-  struct qdmsan_thread_accumulators **link = &qdmsan_threads;
+-  while (*link && *link != acc) link = &(*link)->next;
+-  if (*link) *link = acc->next;
+-  acc->registered = false;
+-  pthread_mutex_unlock(&qdmsan_threads_lock);
++  if (value) { qdmsan_qemu_flush_tls(); }
+ }
+ 
+ static void qdmsan_make_flush_key(void) {
+-  if (pthread_key_create(&qdmsan_flush_key, qdmsan_thread_flush_destructor)) {
+-    abort();
+-  }
++  (void)pthread_key_create(&qdmsan_flush_key, qdmsan_thread_flush_destructor);
+ }
+ 
+ static inline void qdmsan_mark_thread_for_flush(void) {
+-  if (likely(qdmsan_thread_acc.registered)) return;
+   pthread_once(&qdmsan_flush_key_once, qdmsan_make_flush_key);
+-  uint64_t *lanes[9] = {
+-      &__qdmsan_qemu_h1, &__qdmsan_qemu_h2, &__qdmsan_qemu_cnt,
+-      &qdmsan_oob_h1, &qdmsan_oob_h2, &qdmsan_oob_cnt,
+-      &qdmsan_uaf_h1, &qdmsan_uaf_h2, &qdmsan_uaf_cnt};
+-  memcpy(qdmsan_thread_acc.lanes, lanes, sizeof(lanes));
+-  if (pthread_setspecific(qdmsan_flush_key, &qdmsan_thread_acc)) abort();
+-  pthread_mutex_lock(&qdmsan_threads_lock);
+-  qdmsan_thread_acc.next = qdmsan_threads;
+-  qdmsan_threads = &qdmsan_thread_acc;
+-  qdmsan_thread_acc.registered = true;
+-  pthread_mutex_unlock(&qdmsan_threads_lock);
+-}
+-
+-static void qdmsan_flush_all_locked(void) {
+-  for (struct qdmsan_thread_accumulators *acc = qdmsan_threads;
+-       acc; acc = acc->next) {
+-    qdmsan_flush_accumulators(acc);
+-  }
+-}
+-
+-/* Guest fork already owns the QEMU exclusive section.  Drain before the
+- * address space is copied: pre-fork events belong to the shared map once. */
+-void qdmsan_qemu_fork_start(void) {
+-  pthread_mutex_lock(&qdmsan_threads_lock);
+-  if (!qdmsan_paper_compat) qdmsan_flush_all_locked();
+-}
+-
+-void qdmsan_qemu_fork_end(int child) {
+-  if (child) {
+-    qdmsan_threads = qdmsan_thread_acc.registered ? &qdmsan_thread_acc : NULL;
+-    qdmsan_thread_acc.next = NULL;
+-  }
+-  pthread_mutex_unlock(&qdmsan_threads_lock);
++  if (!pthread_getspecific(qdmsan_flush_key)) {
++    (void)pthread_setspecific(qdmsan_flush_key, (void *)1);
++  }
+ }
+ 
+ static inline void qdmsan_record(uint64_t v, uint32_t site_id) {
+@@ -1521,7 +1483,7 @@
+ 
+   /* AFL++ still uses the fast digest as the online oracle in full mode; the
+      full map is the localization/reporting plane. */
+-  int record_fast = __qdmsan_qemu_map != NULL;
++  int record_fast = __qdmsan_qemu_map;
+   int record_aux = __qdmsan_qemu_feedback_map &&
+                    qdmsan_record_mode == QDMSAN_MODE_FAST_AUX;
+   int record_full = __qdmsan_qemu_full_map &&
+@@ -1645,28 +1607,8 @@
+ }
+ 
+ void qdmsan_qemu_flush(void) {
+-  pthread_mutex_lock(&qdmsan_threads_lock);
+-  qdmsan_flush_accumulators(&qdmsan_thread_acc);
+-  pthread_mutex_unlock(&qdmsan_threads_lock);
+-
+-  qdmsan_dump_guest_maps();
+-  qdmsan_lookup_guest_pc();
+-}
+-
+-/* Called only outside cpu_exec, immediately before normal process exit.
+- * Keep the exclusive section until exit_group kills the stopped CPUs.
+- * Syscall writers can finish before the drain, or observe process_exiting
+- * after it, but cannot race with reads of their TLS accumulators. */
+-void qdmsan_qemu_flush_process(void) {
+-  if (!use_qdmsan || qdmsan_paper_compat) {
+-    qdmsan_qemu_flush();
+-    return;
+-  }
+-  start_exclusive();
+-  pthread_mutex_lock(&qdmsan_threads_lock);
+-  qdmsan_process_exiting = true;
+-  qdmsan_flush_all_locked();
+-  pthread_mutex_unlock(&qdmsan_threads_lock);
++  qdmsan_qemu_flush_tls();
++
+   qdmsan_dump_guest_maps();
+   qdmsan_lookup_guest_pc();
+ }
+@@ -1677,6 +1619,9 @@
+ }
+ 
+ void HELPER(qdmsan_shadow_stack_push)(target_ulong ptr) {
++#if defined(TARGET_ARM)
++  ptr &= ~1;
++#endif
+   if (unlikely(!qdmsan_shadow_stack.first)) {
+     qdmsan_shadow_stack.first = malloc(sizeof(struct qdmsan_shadow_stack_block));
+     qdmsan_shadow_stack.first->index = 0;
+@@ -1697,6 +1642,9 @@
+ }
+ 
+ void HELPER(qdmsan_shadow_stack_pop)(target_ulong ptr) {
++#if defined(TARGET_ARM)
++  ptr &= ~1;
++#endif
+   struct qdmsan_shadow_stack_block *cur_bk = qdmsan_shadow_stack.first;
+   if (unlikely(cur_bk == NULL)) return;
+ 
+@@ -1732,8 +1680,6 @@
+   const char *suppress_ranges_env = getenv("AFL_QDMSAN_SUPPRESS_RANGES");
+   const char *suppress_file_env = getenv("AFL_QDMSAN_SUPPRESS_FILE");
+   const char *stack_max_env = getenv("AFL_QDMSAN_STACK_MAX");
+-  const char *paper_compat_env = getenv("AFL_QDMSAN_PAPER_COMPAT");
+-  qdmsan_paper_compat = paper_compat_env && !strcmp(paper_compat_env, "1");
+ 
+   if (!mode || !*mode || qdmsan_str_eq_ci(mode, "fast")) {
+     qdmsan_record_mode = QDMSAN_MODE_FAST;
+@@ -2467,6 +2413,94 @@
+   qdmsan_record_cmp_outcome((uint64_t)cur_loc, value, QDMSAN_EVENT_AND, 8);
+ }
+ 
++/* --- OR checkpoints: record OR use.
++ * x OR y sets ZF=(result==0), SF=((signed)result<0).
++ * raw/strict records operands. result records ZF+SF of (a | b).
++ *
++ * Filters:
++ *  - identity (0): x OR 0 = x, no fill byte involved.  glibc page probes
++ *    emit "orq $0,(%rsp)" — skip to avoid false positives from stack fill.
++ *  - absorbing (~0): x OR ~0 = ~0, result independent of x.
++ *
++ * bit 0 = ZF (result == 0)
++ * bit 1 = SF (result <s 0, i.e. MSB set)                                  */
++
++void HELPER(qdmsan_or_checkpoint_8)(target_ulong cur_loc,
++                                     target_ulong arg1, target_ulong arg2) {
++  if (!qdmsan_has_recording_map()) return;
++  QDMSAN_MAIN_FILTER();
++  uint8_t a = (uint8_t)arg1, b = (uint8_t)arg2;
++  if (a == 0 || b == 0) return;       /* identity  */
++  if (a == 0xFF || b == 0xFF) return; /* absorbing */
++  if (qdmsan_check_mode == QDMSAN_CHECK_RAW) {
++    qdmsan_record_cmp_raw((uint64_t)cur_loc, a, b, QDMSAN_EVENT_OR, 1);
++    return;
++  }
++  uint8_t result = a | b;
++  qdmsan_dump_entry((uint64_t)cur_loc, (uint64_t)a, (uint64_t)b);
++  int zf = (result == 0);
++  int sf = ((int8_t)result < 0);
++  uint64_t value = (uint64_t)(zf | (sf << 1));
++  qdmsan_record_cmp_outcome((uint64_t)cur_loc, value, QDMSAN_EVENT_OR, 1);
++}
++
++void HELPER(qdmsan_or_checkpoint_16)(target_ulong cur_loc,
++                                      target_ulong arg1, target_ulong arg2) {
++  if (!qdmsan_has_recording_map()) return;
++  QDMSAN_MAIN_FILTER();
++  uint16_t a = (uint16_t)arg1, b = (uint16_t)arg2;
++  if (a == 0 || b == 0) return;           /* identity  */
++  if (a == 0xFFFF || b == 0xFFFF) return; /* absorbing */
++  if (qdmsan_check_mode == QDMSAN_CHECK_RAW) {
++    qdmsan_record_cmp_raw((uint64_t)cur_loc, a, b, QDMSAN_EVENT_OR, 2);
++    return;
++  }
++  uint16_t result = a | b;
++  qdmsan_dump_entry((uint64_t)cur_loc, (uint64_t)a, (uint64_t)b);
++  int zf = (result == 0);
++  int sf = ((int16_t)result < 0);
++  uint64_t value = (uint64_t)(zf | (sf << 1));
++  qdmsan_record_cmp_outcome((uint64_t)cur_loc, value, QDMSAN_EVENT_OR, 2);
++}
++
++void HELPER(qdmsan_or_checkpoint_32)(target_ulong cur_loc,
++                                      target_ulong arg1, target_ulong arg2) {
++  if (!qdmsan_has_recording_map()) return;
++  QDMSAN_MAIN_FILTER();
++  uint32_t a = (uint32_t)arg1, b = (uint32_t)arg2;
++  if (a == 0 || b == 0) return;                    /* identity  */
++  if (a == 0xFFFFFFFFu || b == 0xFFFFFFFFu) return; /* absorbing */
++  if (qdmsan_check_mode == QDMSAN_CHECK_RAW) {
++    qdmsan_record_cmp_raw((uint64_t)cur_loc, a, b, QDMSAN_EVENT_OR, 4);
++    return;
++  }
++  uint32_t result = a | b;
++  qdmsan_dump_entry((uint64_t)cur_loc, (uint64_t)a, (uint64_t)b);
++  int zf = (result == 0);
++  int sf = ((int32_t)result < 0);
++  uint64_t value = (uint64_t)(zf | (sf << 1));
++  qdmsan_record_cmp_outcome((uint64_t)cur_loc, value, QDMSAN_EVENT_OR, 4);
++}
++
++void HELPER(qdmsan_or_checkpoint_64)(target_ulong cur_loc,
++                                      target_ulong arg1, target_ulong arg2) {
++  if (!qdmsan_has_recording_map()) return;
++  QDMSAN_MAIN_FILTER();
++  if (arg1 == 0 || arg2 == 0) return;             /* identity  */
++  if (arg1 == UINT64_MAX || arg2 == UINT64_MAX) return; /* absorbing */
++  if (qdmsan_check_mode == QDMSAN_CHECK_RAW) {
++    qdmsan_record_cmp_raw((uint64_t)cur_loc, (uint64_t)arg1, (uint64_t)arg2,
++                          QDMSAN_EVENT_OR, 8);
++    return;
++  }
++  uint64_t result = (uint64_t)arg1 | (uint64_t)arg2;
++  qdmsan_dump_entry((uint64_t)cur_loc, (uint64_t)arg1, (uint64_t)arg2);
++  int zf = (result == 0);
++  int sf = ((int64_t)result < 0);
++  uint64_t value = (uint64_t)(zf | (sf << 1));
++  qdmsan_record_cmp_outcome((uint64_t)cur_loc, value, QDMSAN_EVENT_OR, 8);
++}
++
+ /* --- SSE/AVX floating-point compare checkpoint --- */
+ 
+ /* ucomiss / ucomisd / comiss / comisd all store their result in env->cc_src
+@@ -2535,10 +2569,9 @@
+                              qdmsan_current_poison());
+ }
+ 
+-static void qdmsan_record_syscall_locked(int num, target_ulong arg1,
+-                                        target_ulong arg2, target_ulong arg3,
+-                                        target_ulong arg4, target_ulong arg5,
+-                                        target_ulong arg6) {
++void qdmsan_record_syscall(int num, target_ulong arg1, target_ulong arg2,
++                           target_ulong arg3, target_ulong arg4,
++                           target_ulong arg5, target_ulong arg6) {
+   if (!qdmsan_syscall_checks_enabled) return;
+   if (num == QDMSAN_FAKESYS_NR) return;
+   if (!qdmsan_has_recording_map()) return;
+@@ -2853,19 +2886,6 @@
+     default:
+       break;
+   }
+-}
+-
+-void qdmsan_record_syscall(int num, target_ulong arg1, target_ulong arg2,
+-                           target_ulong arg3, target_ulong arg4,
+-                           target_ulong arg5, target_ulong arg6) {
+-  if (!qdmsan_syscall_checks_enabled || num == QDMSAN_FAKESYS_NR ||
+-      !qdmsan_has_recording_map()) return;
+-  qdmsan_mark_thread_for_flush();
+-  pthread_mutex_lock(&qdmsan_threads_lock);
+-  if (!qdmsan_process_exiting) {
+-    qdmsan_record_syscall_locked(num, arg1, arg2, arg3, arg4, arg5, arg6);
+-  }
+-  pthread_mutex_unlock(&qdmsan_threads_lock);
+ }
+ 
+ target_ulong qdmsan_actions_dispatcher(target_ulong action, target_ulong arg1,
+@@ -2901,15 +2921,10 @@
+       }
+       return 0;
+     case QDMSAN_ACTION_RECORD:
+-      qdmsan_mark_thread_for_flush();
+-      pthread_mutex_lock(&qdmsan_threads_lock);
+-      if (!qdmsan_process_exiting) {
+-        qdmsan_record_event_filtered((uint64_t)arg1, (uint64_t)arg2,
++      qdmsan_record_event_filtered((uint64_t)arg1, (uint64_t)arg2,
+                                    QDMSAN_EVENT_LIBC |
+                                        (((uint32_t)arg3 & 0xffffu) << 8),
+                                    sizeof(target_ulong));
+-      }
+-      pthread_mutex_unlock(&qdmsan_threads_lock);
+       return 0;
+     case QDMSAN_ACTION_FIXED_RAND_RAW:
+       if (!arg1 || arg2 < sizeof(uint64_t) || !thread_cpu ||
+--- a/qemu_mode/qemuafl/accel/tcg/tcg-runtime.h
++++ b/qemu_mode/qemuafl/accel/tcg/tcg-runtime.h
+@@ -367,6 +367,11 @@
+ DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_imm_32, TCG_CALL_NO_RWG, void, tl, tl, tl)
+ DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_imm_64, TCG_CALL_NO_RWG, void, tl, tl, tl)
+ 
++/* QDMSAN: OR checkpoints — absorbing element is all-ones, skip if either operand == ~0 */
++DEF_HELPER_FLAGS_3(qdmsan_or_checkpoint_8,  TCG_CALL_NO_RWG, void, tl, tl, tl)
++DEF_HELPER_FLAGS_3(qdmsan_or_checkpoint_16, TCG_CALL_NO_RWG, void, tl, tl, tl)
++DEF_HELPER_FLAGS_3(qdmsan_or_checkpoint_32, TCG_CALL_NO_RWG, void, tl, tl, tl)
++DEF_HELPER_FLAGS_3(qdmsan_or_checkpoint_64, TCG_CALL_NO_RWG, void, tl, tl, tl)
+ /* QDMSAN: SSE/AVX floating-point compare checkpoint (ucomiss/ucomisd/comiss/comisd).
+  * Records CC_SRC (EFLAGS) after the comparison: one of CC_C=0x1 (less),
+  * CC_Z=0x40 (equal), 0 (greater), CC_Z|CC_P|CC_C=0x45 (unordered/NaN). */
+@@ -398,4 +403,4 @@
+ DEF_HELPER_FLAGS_1(qasan_shadow_stack_push, TCG_CALL_NO_RWG, void, tl)
+ DEF_HELPER_FLAGS_1(qasan_shadow_stack_pop, TCG_CALL_NO_RWG, void, tl)
+ 
+-DEF_HELPER_FLAGS_4(ijon_func_call, TCG_CALL_NO_RWG, void, tl, tl, tl, tl)
+\ No newline at end of file
++DEF_HELPER_FLAGS_4(ijon_func_call, TCG_CALL_NO_RWG, void, tl, tl, tl, tl)
+--- a/qemu_mode/qemuafl/linux-user/main.c
++++ b/qemu_mode/qemuafl/linux-user/main.c
+@@ -131,7 +131,6 @@
+ void fork_start(void)
+ {
+     start_exclusive();
+-    if (use_qdmsan) qdmsan_qemu_fork_start();
+     mmap_fork_start();
+     cpu_list_lock();
+ }
+@@ -139,7 +138,6 @@
+ void fork_end(int child)
+ {
+     mmap_fork_end(child);
+-    if (use_qdmsan) qdmsan_qemu_fork_end(child);
+     if (child) {
+         CPUState *cpu, *next_cpu;
+         /* Child processes created by fork() only have a single thread.
+--- a/qemu_mode/qemuafl/linux-user/syscall.c
++++ b/qemu_mode/qemuafl/linux-user/syscall.c
+@@ -8704,7 +8704,7 @@
+ 
+         pthread_mutex_unlock(&clone_lock);
+         preexit_cleanup(cpu_env, arg1);
+-        qdmsan_qemu_flush_process();
++        qdmsan_qemu_flush();
+         _exit(arg1);
+         return 0; /* avoid warning */
+     case TARGET_NR_read:
+@@ -10463,11 +10463,6 @@
+ #endif
+ #if defined(TARGET_NR_getrandom) && defined(__NR_getrandom)
+     case TARGET_NR_getrandom:
+-        if (use_qdmsan) {
+-            ret = get_errno(getrandom(NULL, 0, arg3));
+-            if (is_error(ret)) return ret;
+-            if (!arg2) return 0;
+-        }
+         p = lock_user(VERIFY_WRITE, arg1, arg2, 0);
+         if (!p) {
+             return -TARGET_EFAULT;
+@@ -10807,7 +10802,7 @@
+         /* new thread calls */
+     case TARGET_NR_exit_group:
+         preexit_cleanup(cpu_env, arg1);
+-        qdmsan_qemu_flush_process();
++        qdmsan_qemu_flush();
+         return get_errno(exit_group(arg1));
+ #endif
+     case TARGET_NR_setdomainname:
+@@ -12875,8 +12870,6 @@
+     {
+         struct timespec ts;
+         if (use_qdmsan) {
+-            ret = get_errno(clock_getres(arg1, NULL));
+-            if (is_error(ret)) return ret;
+             ts.tv_sec = (time_t)qdmsan_fixed_time_sec_next();
+             ts.tv_nsec = (long)(__qdmsan_qemu_map
+                                      ? __qdmsan_qemu_map->fixed_time_usec
+@@ -12897,8 +12890,6 @@
+     {
+         struct timespec ts;
+         if (use_qdmsan) {
+-            ret = get_errno(clock_getres(arg1, NULL));
+-            if (is_error(ret)) return ret;
+             ts.tv_sec = (time_t)qdmsan_fixed_time_sec_next();
+             ts.tv_nsec = (long)(__qdmsan_qemu_map
+                                      ? __qdmsan_qemu_map->fixed_time_usec
+@@ -12919,16 +12910,14 @@
+     {
+         struct timespec ts;
+         if (use_qdmsan) {
+-            ret = get_errno(clock_getres(arg1, NULL));
+-            if (is_error(ret)) return ret;
+             ts.tv_sec = 0;
+             ts.tv_nsec = 1;
+             ret = 0;
+         } else {
+             ret = get_errno(clock_getres(arg1, &ts));
+         }
+-        if (!is_error(ret) && arg2) {
+-            ret = host_to_target_timespec(arg2, &ts);
++        if (!is_error(ret)) {
++            host_to_target_timespec(arg2, &ts);
+         }
+         return ret;
+     }
+@@ -12938,16 +12927,14 @@
+     {
+         struct timespec ts;
+         if (use_qdmsan) {
+-            ret = get_errno(clock_getres(arg1, NULL));
+-            if (is_error(ret)) return ret;
+             ts.tv_sec = 0;
+             ts.tv_nsec = 1;
+             ret = 0;
+         } else {
+             ret = get_errno(clock_getres(arg1, &ts));
+         }
+-        if (!is_error(ret) && arg2) {
+-            ret = host_to_target_timespec64(arg2, &ts);
++        if (!is_error(ret)) {
++            host_to_target_timespec64(arg2, &ts);
+         }
+         return ret;
+     }
+--- a/qemu_mode/qemuafl/qemuafl/cpu-translate.h
++++ b/qemu_mode/qemuafl/qemuafl/cpu-translate.h
+@@ -51,7 +51,7 @@
+ /*
+  * qdmsan_gen_checkpoint — TCG-level icmp checkpoint for CMP/SUB.
+  * Records both operands via QDMSAN fast/full event helpers.
+- * Emitted only with a fast map and a permitted main-program instruction.
++ * Enabled when AFL_USE_QDMSAN=1 (__qdmsan_qemu_map != NULL).
+  */
+ static void qdmsan_gen_checkpoint(target_ulong cur_loc, TCGv arg1, TCGv arg2,
+                                    MemOp ot) {
+@@ -110,9 +110,26 @@
+ }
+ 
+ /*
++ * qdmsan_gen_or_checkpoint — OR: skip if either operand is all-ones
++ * (absorbing element: ~0 OR x == ~0 regardless of x).
++ */
++static void qdmsan_gen_or_checkpoint(target_ulong cur_loc, TCGv arg1,
++                                      TCGv arg2, MemOp ot) {
++  if (!qdmsan_gen_should_emit(cur_loc)) return;
++  TCGv cur_loc_v = tcg_const_tl(cur_loc);
++  switch (ot & MO_SIZE) {
++    case MO_64: gen_helper_qdmsan_or_checkpoint_64(cur_loc_v, arg1, arg2); break;
++    case MO_32: gen_helper_qdmsan_or_checkpoint_32(cur_loc_v, arg1, arg2); break;
++    case MO_16: gen_helper_qdmsan_or_checkpoint_16(cur_loc_v, arg1, arg2); break;
++    default:    gen_helper_qdmsan_or_checkpoint_8(cur_loc_v, arg1, arg2);  break;
++  }
++  tcg_temp_free(cur_loc_v);
++}
++
++/*
+  * qdmsan_gen_ucomis_checkpoint — emit TCG call after ucomiss/ucomisd/comiss/comisd.
+  * The helper reads env->cc_src (set by the SSE compare helper to one of four
+- * EFLAGS values) and records it as the checkpoint value.
++ * EFLAGS values) and records it as the checkpoint value.  Only active in strict mode.
+  */
+ static void qdmsan_gen_ucomis_checkpoint(target_ulong cur_loc) {
+   if (!qdmsan_gen_should_emit(cur_loc)) return;
+@@ -292,4 +309,3 @@
+   }
+ 
+ }
+-
+--- a/qemu_mode/qemuafl/qemuafl/imported/config.h
++++ b/qemu_mode/qemuafl/qemuafl/imported/config.h
+@@ -208,7 +208,8 @@
+ #define KEEP_UNIQUE_HANG 512U
+ #define KEEP_UNIQUE_CRASH 25600U
+ #define KEEP_UNIQUE_DMSAN 25600U
+-#define KEEP_UNIQUE_MSAN_ONLY 25600U
++#define KEEP_UNIQUE_DSAN 25600U
++#define KEEP_UNIQUE_MSAN_ONLY  25600U
+ #define KEEP_UNIQUE_DMSAN_ONLY 25600U
+ 
+ /* Baseline number of random tweaks during a single 'havoc' stage: */
+--- a/qemu_mode/qemuafl/qemuafl/qdmsan-qemu.h
++++ b/qemu_mode/qemuafl/qemuafl/qdmsan-qemu.h
+@@ -234,12 +234,8 @@
+ /* Called from linux-user/main.c at startup */
+ void qdmsan_qemu_init(void);
+ 
+-/* Thread exit commits the calling TLS; process exit quiesces all writers. */
++/* Called at program exit to commit TLS state to SHM */
+ void qdmsan_qemu_flush(void);
+-void qdmsan_qemu_flush_process(void);
+-/* Called within the guest fork exclusive section. */
+-void qdmsan_qemu_fork_start(void);
+-void qdmsan_qemu_fork_end(int child);
+ 
+ /* Translation-time gate for TCG-generated QDMSAN checkpoints. */
+ int qdmsan_should_emit_tcg_event(target_ulong pc);
+--- a/qemu_mode/qemuafl/target/arm/translate-a64.c
++++ b/qemu_mode/qemuafl/target/arm/translate-a64.c
+@@ -1343,6 +1343,8 @@
+ 
+     if (insn & (1U << 31)) {
+         /* BL Branch with link */
++        if (use_qdmsan && qdmsan_max_call_stack)
++          gen_helper_qdmsan_shadow_stack_push(tcg_const_tl(s->pc_curr + 4));
+         if (use_qasan && qasan_max_call_stack)
+           gen_helper_qasan_shadow_stack_push(tcg_const_tl(s->pc_curr + 4));
+         tcg_gen_movi_i64(cpu_reg(s, 30), s->base.pc_next);
+@@ -2248,6 +2250,12 @@
+ 
+         default:
+             goto do_unallocated;
++        }
++        if (use_qdmsan && qdmsan_max_call_stack) {
++          if (opc == 2 && rn == 30)
++            gen_helper_qdmsan_shadow_stack_pop(cpu_reg(s, 30));
++          else if (opc == 1)
++            gen_helper_qdmsan_shadow_stack_push(tcg_const_tl(s->pc_curr + 4));
+         }
+         if (use_qasan && qasan_max_call_stack) {
+           if (opc == 2 && rn == 30)
+@@ -4232,6 +4240,7 @@
+     if (rd == 31 && sub_op) { // cmp xX, imm
+       TCGv_i64 tcg_imm = tcg_const_i64(imm);
+       afl_gen_compcov(s->pc_curr, tcg_rn, tcg_imm, is_64bit ? MO_64 : MO_32, 1);
++      qdmsan_gen_checkpoint(s->pc_curr, tcg_rn, tcg_imm, is_64bit ? MO_64 : MO_32);
+       tcg_temp_free_i64(tcg_imm);
+     }
+ 
+@@ -4896,9 +4905,11 @@
+ 
+     tcg_rm = read_cpu_reg(s, rm, sf);
+     ext_and_shift_reg(tcg_rm, tcg_rm, option, imm3);
+-    
+-    if (rd == 31 && sub_op) // cmp xX, xY
++
++    if (rd == 31 && sub_op) { // cmp xX, xY
+       afl_gen_compcov(s->pc_curr, tcg_rn, tcg_rm, sf ? MO_64 : MO_32, 0);
++      qdmsan_gen_checkpoint(s->pc_curr, tcg_rn, tcg_rm, sf ? MO_64 : MO_32);
++    }
+ 
+     tcg_result = tcg_temp_new_i64();
+ 
+@@ -4963,9 +4974,11 @@
+     tcg_rm = read_cpu_reg(s, rm, sf);
+ 
+     shift_reg_imm(tcg_rm, tcg_rm, sf, shift_type, imm6);
+-    
+-    if (rd == 31 && sub_op) // cmp xX, xY
++
++    if (rd == 31 && sub_op) { // cmp xX, xY
+       afl_gen_compcov(s->pc_curr, tcg_rn, tcg_rm, sf ? MO_64 : MO_32, 0);
++      qdmsan_gen_checkpoint(s->pc_curr, tcg_rn, tcg_rm, sf ? MO_64 : MO_32);
++    }
+ 
+     tcg_result = tcg_temp_new_i64();
+ 
+@@ -5250,6 +5263,7 @@
+     tcg_rn = cpu_reg(s, rn);
+ 
+     afl_gen_compcov(s->pc_curr, tcg_rn, tcg_y, sf ? MO_64 : MO_32, is_imm);
++    qdmsan_gen_checkpoint(s->pc_curr, tcg_rn, tcg_y, sf ? MO_64 : MO_32);
+ 
+     /* Set the flags for the new comparison.  */
+     tcg_tmp = tcg_temp_new_i64();
+--- a/qemu_mode/qemuafl/target/arm/translate.c
++++ b/qemu_mode/qemuafl/target/arm/translate.c
+@@ -5644,10 +5644,25 @@
+       tcg_gen_extu_i32_i64(tmp1_64, tmp1);
+       tcg_gen_extu_i32_i64(tmp2_64, tmp2);
+       afl_gen_compcov(s->pc_curr, tmp1_64, tmp2_64, MO_32, 0);
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1_64, tmp2_64, MO_32);
+       tcg_temp_free(tmp1_64);
+       tcg_temp_free(tmp2_64);
+ #else
+       afl_gen_compcov(s->pc_curr, tmp1, tmp2, MO_32, 0);
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1, tmp2, MO_32);
++#endif
++    } else if (logic_cc) {
++      /* TST/TEQ: AND or XOR updating flags — checkpoint the operands */
++#ifdef TARGET_AARCH64
++      TCGv tmp1_64 = tcg_temp_new();
++      TCGv tmp2_64 = tcg_temp_new();
++      tcg_gen_extu_i32_i64(tmp1_64, tmp1);
++      tcg_gen_extu_i32_i64(tmp2_64, tmp2);
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1_64, tmp2_64, MO_32);
++      tcg_temp_free(tmp1_64);
++      tcg_temp_free(tmp2_64);
++#else
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1, tmp2, MO_32);
+ #endif
+     }
+ 
+@@ -5700,10 +5715,24 @@
+       tcg_gen_extu_i32_i64(tmp1_64, tmp1);
+       tcg_gen_extu_i32_i64(tmp2_64, tmp2);
+       afl_gen_compcov(s->pc_curr, tmp1_64, tmp2_64, MO_32, 0);
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1_64, tmp2_64, MO_32);
+       tcg_temp_free(tmp1_64);
+       tcg_temp_free(tmp2_64);
+ #else
+       afl_gen_compcov(s->pc_curr, tmp1, tmp2, MO_32, 0);
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1, tmp2, MO_32);
++#endif
++    } else if (logic_cc) {
++#ifdef TARGET_AARCH64
++      TCGv tmp1_64 = tcg_temp_new();
++      TCGv tmp2_64 = tcg_temp_new();
++      tcg_gen_extu_i32_i64(tmp1_64, tmp1);
++      tcg_gen_extu_i32_i64(tmp2_64, tmp2);
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1_64, tmp2_64, MO_32);
++      tcg_temp_free(tmp1_64);
++      tcg_temp_free(tmp2_64);
++#else
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1, tmp2, MO_32);
+ #endif
+     }
+ 
+@@ -5764,10 +5793,24 @@
+       tcg_gen_extu_i32_i64(tmp1_64, tmp1);
+       tcg_gen_extu_i32_i64(tmp2_64, tmp2);
+       afl_gen_compcov(s->pc_curr, tmp1_64, tmp2_64, MO_32, 0);
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1_64, tmp2_64, MO_32);
+       tcg_temp_free(tmp1_64);
+       tcg_temp_free(tmp2_64);
+ #else
+       afl_gen_compcov(s->pc_curr, tmp1, tmp2, MO_32, 0);
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1, tmp2, MO_32);
++#endif
++    } else if (logic_cc) {
++#ifdef TARGET_AARCH64
++      TCGv tmp1_64 = tcg_temp_new();
++      TCGv tmp2_64 = tcg_temp_new();
++      tcg_gen_extu_i32_i64(tmp1_64, tmp1);
++      tcg_gen_extu_i32_i64(tmp2_64, tmp2);
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1_64, tmp2_64, MO_32);
++      tcg_temp_free(tmp1_64);
++      tcg_temp_free(tmp2_64);
++#else
++      qdmsan_gen_checkpoint(s->pc_curr, tmp1, tmp2, MO_32);
+ #endif
+     }
+ 
+--- a/qemu_mode/qemuafl/target/i386/tcg/translate.c
++++ b/qemu_mode/qemuafl/target/i386/tcg/translate.c
+@@ -1532,11 +1532,11 @@
+             tcg_gen_neg_tl(s1->T0, s1->T1);
+             tcg_gen_atomic_fetch_add_tl(s1->cc_srcT, s1->A0, s1->T0,
+                                         s1->mem_index, ot | MO_LE);
+-            afl_gen_compcov(s1->pc, s1->cc_srcT, s1->T1, ot, d == OR_EAX);
++            afl_gen_compcov(s1->pc_start, s1->cc_srcT, s1->T1, ot, d == OR_EAX);
+             tcg_gen_sub_tl(s1->T0, s1->cc_srcT, s1->T1);
+         } else {
+             tcg_gen_mov_tl(s1->cc_srcT, s1->T0);
+-            afl_gen_compcov(s1->pc, s1->T0, s1->T1, ot, d == OR_EAX);
++            afl_gen_compcov(s1->pc_start, s1->T0, s1->T1, ot, d == OR_EAX);
+             tcg_gen_sub_tl(s1->T0, s1->T0, s1->T1);
+             gen_op_st_rm_T0_A0(s1, ot, d);
+             /* QDMSAN: fill new stack frame if SUB RSP, N (d == R_ESP).
+@@ -1584,7 +1584,7 @@
+     case OP_CMPL:
+         tcg_gen_mov_tl(cpu_cc_src, s1->T1);
+         tcg_gen_mov_tl(s1->cc_srcT, s1->T0);
+-        afl_gen_compcov(s1->pc, s1->T0, s1->T1, ot, d == OR_EAX);
++        afl_gen_compcov(s1->pc_start, s1->T0, s1->T1, ot, d == OR_EAX);
+         if (s1->qdmsan_t1_static_const) {
+             qdmsan_gen_checkpoint_imm(s1->pc_start, s1->T0, s1->T1, ot);
+         } else {
+--- a/qemu_mode/qemuafl/util/guest-random.c
++++ b/qemu_mode/qemuafl/util/guest-random.c
+@@ -38,7 +38,7 @@
+     }
+     if (i < len) {
+         x = g_rand_int(rand);
+-        __builtin_memcpy(buf + i, &x, i - len);
++        __builtin_memcpy(buf + i, &x, len - i);
+     }
+     return 0;
+ }

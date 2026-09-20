@@ -86,7 +86,6 @@ libAFLQemuDriver.a
 out
 qemu_mode/libcompcov/compcovtest
 qemu_mode/qemu-*
-qemu_mode/qemuafl
 t
 test-instr
 test/.afl_performance
@@ -114,6 +113,7 @@ utils/afl_proxy/afl-proxy
 utils/bench/hash
 utils/optimin/build
 utils/optimin/optimin
+utils/qdmsan-diff/qdmsan-diff
 utils/persistent_mode/persistent_demo
 utils/persistent_mode/persistent_demo_new
 utils/persistent_mode/persistent_demo_new_compat
@@ -127,3 +127,9 @@ utils/plot_ui/afl-plot-ui
 vuln_prog
 argv_fuzz_demo
 argv_fuzz_persistent_demo
+
+# QDMSan release outputs
+/build/
+/build-logs/
+/qemu_mode/qemuafl/build-release/
+/qemu_mode/qemuafl/build-release-*/

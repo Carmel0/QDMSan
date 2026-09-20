@@ -257,6 +257,11 @@ void create_alias_table(afl_state_t *afl) {
 
           if (unlikely(!q->was_fuzzed)) { weight *= 2.5; }
           if (unlikely(q->fs_redundant)) { weight *= 0.75; }
+          if (unlikely(q->has_new_dmsan_feedback)) {
+
+            weight *= q->has_new_cov ? 1.35 : 1.15;
+
+          }
 
         }
 
@@ -1314,6 +1319,13 @@ u32 calculate_score(afl_state_t *afl, struct queue_entry *q) {
       break;
     default:
       perf_score *= 5;
+
+  }
+
+  if (unlikely(q->has_new_dmsan_feedback)) {
+
+    perf_score =
+        (u32)((double)perf_score * (q->has_new_cov ? 1.30 : 1.15));
 
   }
 

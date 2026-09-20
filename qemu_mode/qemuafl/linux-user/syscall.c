@@ -154,6 +154,352 @@
 
 #include "qemuafl/common.h"
 #include "qemuafl/qasan-qemu.h"
+#include "qemuafl/qdmsan-qemu.h"
+
+#define QDMSAN_SYNTH_SHMID_BASE 0x40000000
+#define QDMSAN_SHMID_MAP_MAX 256
+#define QDMSAN_ENTROPY_FD_MAX 4096
+#define QDMSAN_SYNTH_PARENT_PID 100000
+#define QDMSAN_SYNTH_SELF_PID 100001
+#define QDMSAN_SYNTH_CHILD_BASE 300000
+#define QDMSAN_PID_MAP_MAX 256
+
+struct qdmsan_shmid_map_entry {
+    int real;
+    int synth;
+};
+
+struct qdmsan_pid_map_entry {
+    pid_t real;
+    pid_t synth;
+};
+
+static pthread_mutex_t qdmsan_shmid_map_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct qdmsan_shmid_map_entry
+    qdmsan_shmid_map[QDMSAN_SHMID_MAP_MAX];
+static int qdmsan_next_synth_shmid = QDMSAN_SYNTH_SHMID_BASE;
+static uint8_t qdmsan_entropy_fds[QDMSAN_ENTROPY_FD_MAX];
+static pthread_mutex_t qdmsan_pid_map_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct qdmsan_pid_map_entry qdmsan_pid_map[QDMSAN_PID_MAP_MAX];
+static pid_t qdmsan_self_synth_pid = QDMSAN_SYNTH_SELF_PID;
+static pid_t qdmsan_parent_synth_pid = QDMSAN_SYNTH_PARENT_PID;
+static pid_t qdmsan_next_synth_pid = QDMSAN_SYNTH_CHILD_BASE;
+
+static bool qdmsan_fd_in_range(int fd)
+{
+    return fd >= 0 && fd < QDMSAN_ENTROPY_FD_MAX;
+}
+
+static bool qdmsan_open_flags_allow_read(int flags)
+{
+#ifdef O_ACCMODE
+    return (flags & O_ACCMODE) != O_WRONLY;
+#else
+    (void)flags;
+    return true;
+#endif
+}
+
+static bool qdmsan_is_entropy_path(const char *path)
+{
+    return path &&
+           (!strcmp(path, "/dev/urandom") ||
+            !strcmp(path, "/dev/random") ||
+            !strcmp(path, "/dev/srandom"));
+}
+
+static void qdmsan_set_entropy_fd(int fd, bool is_entropy)
+{
+    if (qdmsan_fd_in_range(fd)) {
+        qdmsan_entropy_fds[fd] = is_entropy ? 1 : 0;
+    }
+}
+
+static void qdmsan_update_entropy_fd_for_path(int fd, const char *path,
+                                              int flags)
+{
+    if (!use_qdmsan) {
+        return;
+    }
+    qdmsan_set_entropy_fd(fd, qdmsan_open_flags_allow_read(flags) &&
+                                  qdmsan_is_entropy_path(path));
+}
+
+static bool qdmsan_should_virtualize_entropy_fd(int fd)
+{
+    return use_qdmsan && qdmsan_fd_in_range(fd) && qdmsan_entropy_fds[fd];
+}
+
+static void qdmsan_fill_fixed_rusage(struct rusage *rusage)
+{
+    if (!use_qdmsan || !rusage) {
+        return;
+    }
+
+    memset(rusage, 0, sizeof(*rusage));
+    uint64_t usec = __qdmsan_qemu_map ? __qdmsan_qemu_map->fixed_time_usec : 0;
+    rusage->ru_utime.tv_sec = (time_t)(usec / 1000000);
+    rusage->ru_utime.tv_usec = (suseconds_t)(usec % 1000000);
+}
+
+static abi_long qdmsan_fill_fixed_rand_iovec(struct iovec *vec, int count)
+{
+    abi_long total = 0;
+
+    for (int i = 0; i < count; ++i) {
+        if (vec[i].iov_len > INT64_MAX - total) {
+            return -TARGET_EINVAL;
+        }
+        qdmsan_fill_fixed_rand_bytes(vec[i].iov_base, vec[i].iov_len);
+        total += vec[i].iov_len;
+    }
+
+    return total;
+}
+
+static abi_long qdmsan_copy_iovecs(struct iovec *dst, int dstcnt,
+                                   struct iovec *src, int srccnt)
+{
+    int di = 0, si = 0;
+    size_t doff = 0, soff = 0;
+    abi_long total = 0;
+
+    while (di < dstcnt && si < srccnt) {
+        size_t dleft = dst[di].iov_len - doff;
+        size_t sleft = src[si].iov_len - soff;
+        size_t n = MIN(dleft, sleft);
+
+        if (n) {
+            memcpy((char *)dst[di].iov_base + doff,
+                   (char *)src[si].iov_base + soff, n);
+            total += n;
+            doff += n;
+            soff += n;
+        }
+        if (doff == dst[di].iov_len) {
+            ++di;
+            doff = 0;
+        }
+        if (soff == src[si].iov_len) {
+            ++si;
+            soff = 0;
+        }
+    }
+
+    return total;
+}
+
+static pid_t qdmsan_alloc_synth_child_pid(void)
+{
+    pid_t synth;
+
+    if (!use_qdmsan) {
+        return 0;
+    }
+
+    pthread_mutex_lock(&qdmsan_pid_map_lock);
+    synth = qdmsan_next_synth_pid++;
+    pthread_mutex_unlock(&qdmsan_pid_map_lock);
+    return synth;
+}
+
+static pid_t qdmsan_register_child_pid(pid_t synth, pid_t real)
+{
+    if (!use_qdmsan || synth <= 0 || real <= 0) {
+        return real;
+    }
+
+    pthread_mutex_lock(&qdmsan_pid_map_lock);
+    for (int i = 0; i < QDMSAN_PID_MAP_MAX; ++i) {
+        if (!qdmsan_pid_map[i].real || qdmsan_pid_map[i].synth == synth ||
+            qdmsan_pid_map[i].real == real) {
+            qdmsan_pid_map[i].real = real;
+            qdmsan_pid_map[i].synth = synth;
+            pthread_mutex_unlock(&qdmsan_pid_map_lock);
+            return synth;
+        }
+    }
+    pthread_mutex_unlock(&qdmsan_pid_map_lock);
+    return synth;
+}
+
+static void qdmsan_become_child_pid(pid_t synth)
+{
+    if (!use_qdmsan || synth <= 0) {
+        return;
+    }
+    qdmsan_parent_synth_pid = qdmsan_self_synth_pid;
+    qdmsan_self_synth_pid = synth;
+    qdmsan_next_synth_pid = QDMSAN_SYNTH_CHILD_BASE;
+    memset(qdmsan_pid_map, 0, sizeof(qdmsan_pid_map));
+}
+
+static void qdmsan_forget_pid(pid_t pid)
+{
+    if (!use_qdmsan || pid <= 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&qdmsan_pid_map_lock);
+    for (int i = 0; i < QDMSAN_PID_MAP_MAX; ++i) {
+        if (qdmsan_pid_map[i].synth == pid || qdmsan_pid_map[i].real == pid) {
+            qdmsan_pid_map[i].real = 0;
+            qdmsan_pid_map[i].synth = 0;
+        }
+    }
+    pthread_mutex_unlock(&qdmsan_pid_map_lock);
+}
+
+static pid_t qdmsan_synth_to_real_pid(pid_t pid)
+{
+    pid_t ret = pid;
+
+    if (!use_qdmsan || pid <= 0) {
+        return pid;
+    }
+    if (pid == qdmsan_self_synth_pid) {
+        return getpid();
+    }
+    if (pid == qdmsan_parent_synth_pid) {
+        return getppid();
+    }
+
+    pthread_mutex_lock(&qdmsan_pid_map_lock);
+    for (int i = 0; i < QDMSAN_PID_MAP_MAX; ++i) {
+        if (qdmsan_pid_map[i].synth == pid) {
+            ret = qdmsan_pid_map[i].real;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&qdmsan_pid_map_lock);
+    return ret;
+}
+
+static pid_t qdmsan_real_to_synth_pid(pid_t pid)
+{
+    pid_t ret = pid;
+
+    if (!use_qdmsan || pid <= 0) {
+        return pid;
+    }
+    if (pid == getpid()) {
+        return qdmsan_self_synth_pid;
+    }
+    if (pid == getppid()) {
+        return qdmsan_parent_synth_pid;
+    }
+
+    pthread_mutex_lock(&qdmsan_pid_map_lock);
+    for (int i = 0; i < QDMSAN_PID_MAP_MAX; ++i) {
+        if (qdmsan_pid_map[i].real == pid) {
+            ret = qdmsan_pid_map[i].synth;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&qdmsan_pid_map_lock);
+    return ret;
+}
+
+static const char *qdmsan_translate_proc_pid_path(const char *path,
+                                                  char *buf, size_t buflen)
+{
+    const char *p = path;
+    char *end = NULL;
+    long synth;
+    pid_t real;
+
+    if (!use_qdmsan || !path || strncmp(path, "/proc/", 6)) {
+        return path;
+    }
+
+    p += 6;
+    if (*p < '1' || *p > '9') {
+        return path;
+    }
+
+    errno = 0;
+    synth = strtol(p, &end, 10);
+    if (errno || !end || (*end && *end != '/') || synth <= 0) {
+        return path;
+    }
+
+    real = qdmsan_synth_to_real_pid((pid_t)synth);
+    if (real <= 0 || real == synth) {
+        return path;
+    }
+
+    snprintf(buf, buflen, "/proc/%d%s", real, end);
+    return buf;
+}
+
+static int qdmsan_real_to_synth_shmid(int real)
+{
+    int synth = real;
+
+    if (!use_qdmsan || real < 0) {
+        return real;
+    }
+
+    pthread_mutex_lock(&qdmsan_shmid_map_lock);
+    for (int i = 0; i < QDMSAN_SHMID_MAP_MAX; ++i) {
+        if (qdmsan_shmid_map[i].synth && qdmsan_shmid_map[i].real == real) {
+            synth = qdmsan_shmid_map[i].synth;
+            goto out;
+        }
+    }
+    for (int i = 0; i < QDMSAN_SHMID_MAP_MAX; ++i) {
+        if (!qdmsan_shmid_map[i].synth) {
+            synth = qdmsan_next_synth_shmid++;
+            qdmsan_shmid_map[i].real = real;
+            qdmsan_shmid_map[i].synth = synth;
+            goto out;
+        }
+    }
+
+out:
+    pthread_mutex_unlock(&qdmsan_shmid_map_lock);
+    return synth;
+}
+
+static int qdmsan_synth_to_real_shmid(int shmid)
+{
+    int real = shmid;
+
+    if (!use_qdmsan) {
+        return shmid;
+    }
+
+    pthread_mutex_lock(&qdmsan_shmid_map_lock);
+    for (int i = 0; i < QDMSAN_SHMID_MAP_MAX; ++i) {
+        if (qdmsan_shmid_map[i].synth == shmid) {
+            real = qdmsan_shmid_map[i].real;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&qdmsan_shmid_map_lock);
+    return real;
+}
+
+static void qdmsan_forget_shmid(int shmid)
+{
+    if (!use_qdmsan) {
+        return;
+    }
+
+    pthread_mutex_lock(&qdmsan_shmid_map_lock);
+    for (int i = 0; i < QDMSAN_SHMID_MAP_MAX; ++i) {
+        if (!qdmsan_shmid_map[i].synth) {
+            continue;
+        }
+        if (qdmsan_shmid_map[i].synth == shmid ||
+            qdmsan_shmid_map[i].real == shmid) {
+            qdmsan_shmid_map[i].real = 0;
+            qdmsan_shmid_map[i].synth = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&qdmsan_shmid_map_lock);
+}
 
 #ifndef CLONE_IO
 #define CLONE_IO                0x80000000      /* Clone io context */
@@ -6577,6 +6923,8 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         pthread_mutex_unlock(&clone_lock);
     } else {
         /* if no CLONE_VM, we consider it is a fork */
+        pid_t qdmsan_child_synth = qdmsan_alloc_synth_child_pid();
+
         if (flags & CLONE_INVALID_FORK_FLAGS) {
             return -TARGET_EINVAL;
         }
@@ -6594,6 +6942,7 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
         ret = fork();
         if (ret == 0) {
             /* Child Process.  */
+            qdmsan_become_child_pid(qdmsan_child_synth);
             cpu_clone_regs_child(env, newsp, flags);
             fork_end(1);
             /* There is a race condition here.  The parent process could
@@ -6613,6 +6962,9 @@ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
                 ts->child_tidptr = child_tidptr;
         } else {
             cpu_clone_regs_parent(env, flags);
+            if (ret > 0) {
+                ret = qdmsan_register_child_pid(qdmsan_child_synth, ret);
+            }
             fork_end(0);
         }
     }
@@ -6903,6 +7255,16 @@ static abi_long do_fcntl(int fd, int cmd, abi_ulong arg)
 	    return host_cmd;
 
     switch(cmd) {
+    case TARGET_F_DUPFD:
+#ifdef F_DUPFD_CLOEXEC
+    case TARGET_F_DUPFD_CLOEXEC:
+#endif
+        ret = get_errno(safe_fcntl(fd, host_cmd, arg));
+        if (ret >= 0) {
+            qdmsan_set_entropy_fd(ret, qdmsan_should_virtualize_entropy_fd(fd));
+        }
+        break;
+
     case TARGET_F_GETLK:
         ret = copy_from_user_flock(&fl64, arg);
         if (ret) {
@@ -8016,10 +8378,15 @@ static int is_proc_myself(const char *filename, const char *entry)
         if (!strncmp(filename, "self/", strlen("self/"))) {
             filename += strlen("self/");
         } else if (*filename >= '1' && *filename <= '9') {
-            char myself[80];
+            char myself[80], synth_myself[80];
             snprintf(myself, sizeof(myself), "%d/", getpid());
+            snprintf(synth_myself, sizeof(synth_myself), "%d/",
+                     qdmsan_self_synth_pid);
             if (!strncmp(filename, myself, strlen(myself))) {
                 filename += strlen(myself);
+            } else if (use_qdmsan && !strncmp(filename, synth_myself,
+                                              strlen(synth_myself))) {
+                filename += strlen(synth_myself);
             } else {
                 return 0;
             }
@@ -8177,7 +8544,12 @@ static int do_openat(void *cpu_env, int dirfd, const char *pathname, int flags, 
         return fd;
     }
 
-    return safe_openat(dirfd, path(pathname), flags, mode);
+    {
+        char translated[PATH_MAX];
+        pathname = qdmsan_translate_proc_pid_path(pathname, translated,
+                                                  sizeof(translated));
+        return safe_openat(dirfd, path(pathname), flags, mode);
+    }
 }
 
 #define TIMER_MAGIC 0x0caf0000
@@ -8323,6 +8695,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 do_sys_futex(g2h(cpu, ts->child_tidptr),
                              FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
             }
+            qdmsan_qemu_flush();
             thread_cpu = NULL;
             g_free(ts);
             rcu_unregister_thread();
@@ -8331,6 +8704,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 
         pthread_mutex_unlock(&clone_lock);
         preexit_cleanup(cpu_env, arg1);
+        qdmsan_qemu_flush_process();
         _exit(arg1);
         return 0; /* avoid warning */
     case TARGET_NR_read:
@@ -8339,7 +8713,12 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         } else {
             if (!(p = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
                 return -TARGET_EFAULT;
-            ret = get_errno(safe_read(arg1, p, arg3));
+            if (qdmsan_should_virtualize_entropy_fd(arg1)) {
+                qdmsan_fill_fixed_rand_bytes(p, arg3);
+                ret = arg3;
+            } else {
+                ret = get_errno(safe_read(arg1, p, arg3));
+            }
             if (ret >= 0 &&
                 fd_trans_host_to_target_data(arg1)) {
                 ret = fd_trans_host_to_target_data(arg1)(p, ret);
@@ -8375,6 +8754,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                                   target_to_host_bitmask(arg2, fcntl_flags_tbl),
                                   arg3));
         fd_trans_unregister(ret);
+        if (!is_error(ret)) {
+            qdmsan_update_entropy_fd_for_path(ret, p,
+                                              target_to_host_bitmask(
+                                                  arg2, fcntl_flags_tbl));
+        }
         unlock_user(p, arg1, 0);
         return ret;
 #endif
@@ -8385,6 +8769,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                                   target_to_host_bitmask(arg3, fcntl_flags_tbl),
                                   arg4));
         fd_trans_unregister(ret);
+        if (!is_error(ret)) {
+            qdmsan_update_entropy_fd_for_path(ret, p,
+                                              target_to_host_bitmask(
+                                                  arg3, fcntl_flags_tbl));
+        }
         unlock_user(p, arg2, 0);
         return ret;
 #if defined(TARGET_NR_name_to_handle_at) && defined(CONFIG_OPEN_BY_HANDLE)
@@ -8402,7 +8791,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (unlikely(arg1 == TSL_FD))
             return 0x00;
         fd_trans_unregister(arg1);
-        return get_errno(close(arg1));
+        ret = get_errno(close(arg1));
+        if (!is_error(ret)) {
+            qdmsan_set_entropy_fd(arg1, false);
+        }
+        return ret;
 
     case TARGET_NR_brk:
         return do_brk(arg1);
@@ -8414,10 +8807,15 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_waitpid:
         {
             int status;
-            ret = get_errno(safe_wait4(arg1, &status, arg3, 0));
+            ret = get_errno(safe_wait4(qdmsan_synth_to_real_pid(arg1), &status,
+                                       arg3, 0));
             if (!is_error(ret) && arg2 && ret
                 && put_user_s32(host_to_target_waitstatus(status), arg2))
                 return -TARGET_EFAULT;
+            if (!is_error(ret) && ret > 0) {
+                ret = qdmsan_real_to_synth_pid(ret);
+                qdmsan_forget_pid(ret);
+            }
         }
         return ret;
 #endif
@@ -8426,7 +8824,15 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         {
             siginfo_t info;
             info.si_pid = 0;
-            ret = get_errno(safe_waitid(arg1, arg2, &info, arg4, NULL));
+            id_t waitid_id = arg2;
+            if (arg1 == P_PID) {
+                waitid_id = qdmsan_synth_to_real_pid((pid_t)arg2);
+            }
+            ret = get_errno(safe_waitid(arg1, waitid_id, &info, arg4, NULL));
+            if (!is_error(ret) && info.si_pid > 0) {
+                info.si_pid = qdmsan_real_to_synth_pid(info.si_pid);
+                qdmsan_forget_pid(info.si_pid);
+            }
             if (!is_error(ret) && arg3 && info.si_pid != 0) {
                 if (!(p = lock_user(VERIFY_WRITE, arg3, sizeof(target_siginfo_t), 0)))
                     return -TARGET_EFAULT;
@@ -8629,7 +9035,12 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_time:
         {
             time_t host_time;
-            ret = get_errno(time(&host_time));
+            if (use_qdmsan) {
+                host_time = (time_t)qdmsan_fixed_time_sec_next();
+                ret = host_time;
+            } else {
+                ret = get_errno(time(&host_time));
+            }
             if (!is_error(ret)
                 && arg1
                 && put_user_sal(host_time, arg1))
@@ -8673,7 +9084,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_getpid
     case TARGET_NR_getpid:
-        return get_errno(getpid());
+        return use_qdmsan ? qdmsan_self_synth_pid : get_errno(getpid());
 #endif
     case TARGET_NR_mount:
         {
@@ -8858,7 +9269,8 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return get_errno(syncfs(arg1));
 #endif
     case TARGET_NR_kill:
-        return get_errno(safe_kill(arg1, target_to_host_signal(arg2)));
+        return get_errno(safe_kill(qdmsan_synth_to_real_pid(arg1),
+                                   target_to_host_signal(arg2)));
 #ifdef TARGET_NR_rename
     case TARGET_NR_rename:
         {
@@ -8933,6 +9345,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         ret = get_errno(dup(arg1));
         if (ret >= 0) {
             fd_trans_dup(arg1, ret);
+            qdmsan_set_entropy_fd(ret, qdmsan_should_virtualize_entropy_fd(arg1));
         }
         return ret;
 #ifdef TARGET_NR_pipe
@@ -8948,7 +9361,12 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         {
             struct target_tms *tmsp;
             struct tms tms;
-            ret = get_errno(times(&tms));
+            if (use_qdmsan) {
+                memset(&tms, 0, sizeof(tms));
+                ret = 1000;
+            } else {
+                ret = get_errno(times(&tms));
+            }
             if (arg1) {
                 tmsp = lock_user(VERIFY_WRITE, arg1, sizeof(struct target_tms), 0);
                 if (!tmsp)
@@ -8958,7 +9376,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 tmsp->tms_cutime = tswapal(host_to_target_clock_t(tms.tms_cutime));
                 tmsp->tms_cstime = tswapal(host_to_target_clock_t(tms.tms_cstime));
             }
-            if (!is_error(ret))
+            if (!is_error(ret) && !use_qdmsan)
                 ret = host_to_target_clock_t(ret);
         }
         return ret;
@@ -9002,6 +9420,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         ret = get_errno(dup2(arg1, arg2));
         if (ret >= 0) {
             fd_trans_dup(arg1, arg2);
+            qdmsan_set_entropy_fd(ret, qdmsan_should_virtualize_entropy_fd(arg1));
         }
         return ret;
 #endif
@@ -9017,13 +9436,14 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         ret = get_errno(dup3(arg1, arg2, host_flags));
         if (ret >= 0) {
             fd_trans_dup(arg1, arg2);
+            qdmsan_set_entropy_fd(ret, qdmsan_should_virtualize_entropy_fd(arg1));
         }
         return ret;
     }
 #endif
 #ifdef TARGET_NR_getppid /* not on alpha */
     case TARGET_NR_getppid:
-        return get_errno(getppid());
+        return use_qdmsan ? qdmsan_parent_synth_pid : get_errno(getppid());
 #endif
 #ifdef TARGET_NR_getpgrp
     case TARGET_NR_getpgrp:
@@ -9579,6 +9999,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             struct rusage rusage;
             ret = get_errno(getrusage(arg1, &rusage));
             if (!is_error(ret)) {
+                qdmsan_fill_fixed_rusage(&rusage);
                 ret = host_to_target_rusage(arg2, &rusage);
             }
         }
@@ -9589,7 +10010,16 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             struct timeval tv;
             struct timezone tz;
 
-            ret = get_errno(gettimeofday(&tv, &tz));
+            if (use_qdmsan) {
+                tv.tv_sec = (time_t)qdmsan_fixed_time_sec_next();
+                tv.tv_usec = (suseconds_t)(__qdmsan_qemu_map
+                                                ? __qdmsan_qemu_map->fixed_time_usec
+                                                : 0);
+                memset(&tz, 0, sizeof(tz));
+                ret = 0;
+            } else {
+                ret = get_errno(gettimeofday(&tv, &tz));
+            }
             if (!is_error(ret)) {
                 if (arg1 && copy_to_user_timeval(arg1, &tv)) {
                     return -TARGET_EFAULT;
@@ -9701,7 +10131,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                     memcpy(p2, real, ret);
                 }
             } else {
-                ret = get_errno(readlink(path(p), p2, arg3));
+                char translated[PATH_MAX];
+                const char *link_path =
+                    qdmsan_translate_proc_pid_path(p, translated,
+                                                   sizeof(translated));
+                ret = get_errno(readlink(path(link_path), p2, arg3));
             }
             unlock_user(p2, arg2, ret);
             unlock_user(p, arg1, 0);
@@ -9722,7 +10156,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 ret = temp == NULL ? get_errno(-1) : strlen(real) ;
                 snprintf((char *)p2, arg4, "%s", real);
             } else {
-                ret = get_errno(readlinkat(arg1, path(p), p2, arg4));
+                char translated[PATH_MAX];
+                const char *link_path =
+                    qdmsan_translate_proc_pid_path(p, translated,
+                                                   sizeof(translated));
+                ret = get_errno(readlinkat(arg1, path(link_path), p2, arg4));
             }
             unlock_user(p2, arg3, ret);
             unlock_user(p, arg2, 0);
@@ -10025,11 +10463,23 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #if defined(TARGET_NR_getrandom) && defined(__NR_getrandom)
     case TARGET_NR_getrandom:
+        if (use_qdmsan) {
+            ret = get_errno(getrandom(NULL, 0, arg3));
+            if (is_error(ret)) return ret;
+            if (!arg2) return 0;
+        }
         p = lock_user(VERIFY_WRITE, arg1, arg2, 0);
         if (!p) {
             return -TARGET_EFAULT;
         }
-        ret = get_errno(getrandom(p, arg2, arg3));
+        if (use_qdmsan) {
+            /* Match LLVM DMSAN determinism: fixed_rand_base + counter,
+             * mixed into little-endian 8-byte chunks. */
+            qdmsan_fill_fixed_rand_bytes(p, arg2);
+            ret = (abi_long)arg2;
+        } else {
+            ret = get_errno(getrandom(p, arg2, arg3));
+        }
         unlock_user(p, arg1, ret);
         return ret;
 #endif
@@ -10126,7 +10576,13 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg1))) {
             return -TARGET_EFAULT;
         }
-        ret = get_errno(stat(path(p), &st));
+        {
+            char translated[PATH_MAX];
+            const char *stat_path =
+                qdmsan_translate_proc_pid_path(p, translated,
+                                               sizeof(translated));
+            ret = get_errno(stat(path(stat_path), &st));
+        }
         unlock_user(p, arg1, 0);
         goto do_stat;
 #endif
@@ -10135,7 +10591,13 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg1))) {
             return -TARGET_EFAULT;
         }
-        ret = get_errno(lstat(path(p), &st));
+        {
+            char translated[PATH_MAX];
+            const char *stat_path =
+                qdmsan_translate_proc_pid_path(p, translated,
+                                               sizeof(translated));
+            ret = get_errno(lstat(path(stat_path), &st));
+        }
         unlock_user(p, arg1, 0);
         goto do_stat;
 #endif
@@ -10198,8 +10660,12 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 rusage_ptr = &rusage;
             else
                 rusage_ptr = NULL;
-            ret = get_errno(safe_wait4(arg1, &status, arg3, rusage_ptr));
+            ret = get_errno(safe_wait4(qdmsan_synth_to_real_pid(arg1), &status,
+                                       arg3, rusage_ptr));
             if (!is_error(ret)) {
+                if (rusage_ptr) {
+                    qdmsan_fill_fixed_rusage(rusage_ptr);
+                }
                 if (status_ptr && ret) {
                     status = host_to_target_waitstatus(status);
                     if (put_user_s32(status, status_ptr))
@@ -10210,6 +10676,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                     if (rusage_err) {
                         ret = rusage_err;
                     }
+                }
+                if (ret > 0) {
+                    ret = qdmsan_real_to_synth_pid(ret);
+                    qdmsan_forget_pid(ret);
                 }
             }
         }
@@ -10292,15 +10762,23 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 #ifdef TARGET_NR_shmget
     case TARGET_NR_shmget:
-        return get_errno(shmget(arg1, arg2, arg3));
+        ret = get_errno(shmget(arg1, arg2, arg3));
+        if (!is_error(ret)) {
+            ret = qdmsan_real_to_synth_shmid(ret);
+        }
+        return ret;
 #endif
 #ifdef TARGET_NR_shmctl
     case TARGET_NR_shmctl:
-        return do_shmctl(arg1, arg2, arg3);
+        ret = do_shmctl(qdmsan_synth_to_real_shmid(arg1), arg2, arg3);
+        if (!is_error(ret) && arg2 == IPC_RMID) {
+            qdmsan_forget_shmid(arg1);
+        }
+        return ret;
 #endif
 #ifdef TARGET_NR_shmat
     case TARGET_NR_shmat:
-        return do_shmat(cpu_env, arg1, arg2, arg3);
+        return do_shmat(cpu_env, qdmsan_synth_to_real_shmid(arg1), arg2, arg3);
 #endif
 #ifdef TARGET_NR_shmdt
     case TARGET_NR_shmdt:
@@ -10329,6 +10807,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         /* new thread calls */
     case TARGET_NR_exit_group:
         preexit_cleanup(cpu_env, arg1);
+        qdmsan_qemu_flush_process();
         return get_errno(exit_group(arg1));
 #endif
     case TARGET_NR_setdomainname:
@@ -10625,7 +11104,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         {
             struct iovec *vec = lock_iovec(VERIFY_WRITE, arg2, arg3, 0);
             if (vec != NULL) {
-                ret = get_errno(safe_readv(arg1, vec, arg3));
+                if (qdmsan_should_virtualize_entropy_fd(arg1)) {
+                    ret = qdmsan_fill_fixed_rand_iovec(vec, arg3);
+                } else {
+                    ret = get_errno(safe_readv(arg1, vec, arg3));
+                }
                 unlock_iovec(vec, arg2, arg3, 1);
             } else {
                 ret = -host_to_target_errno(errno);
@@ -10643,6 +11126,59 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
             }
         }
         return ret;
+#if defined(TARGET_NR_process_vm_readv) || defined(TARGET_NR_process_vm_writev)
+#if defined(TARGET_NR_process_vm_readv)
+    case TARGET_NR_process_vm_readv:
+#endif
+#if defined(TARGET_NR_process_vm_writev)
+    case TARGET_NR_process_vm_writev:
+#endif
+        {
+            int is_write = 0;
+            pid_t target_pid = use_qdmsan
+                                   ? qdmsan_synth_to_real_pid((pid_t)arg1)
+                                   : (pid_t)arg1;
+            struct iovec *local_vec, *remote_vec;
+
+#if defined(TARGET_NR_process_vm_writev)
+            if (num == TARGET_NR_process_vm_writev) {
+                is_write = 1;
+            }
+#endif
+            if (arg6) {
+                return -TARGET_EINVAL;
+            }
+            if (!arg3 || !arg5) {
+                return 0;
+            }
+            if (target_pid != getpid()) {
+                return -TARGET_ENOSYS;
+            }
+
+            local_vec = lock_iovec(is_write ? VERIFY_READ : VERIFY_WRITE,
+                                   arg2, arg3, 1);
+            if (!local_vec) {
+                return -host_to_target_errno(errno);
+            }
+            remote_vec = lock_iovec(is_write ? VERIFY_WRITE : VERIFY_READ,
+                                    arg4, arg5, 1);
+            if (!remote_vec) {
+                ret = -host_to_target_errno(errno);
+                unlock_iovec(local_vec, arg2, arg3, 0);
+                return ret;
+            }
+
+            if (is_write) {
+                ret = qdmsan_copy_iovecs(remote_vec, arg5, local_vec, arg3);
+            } else {
+                ret = qdmsan_copy_iovecs(local_vec, arg3, remote_vec, arg5);
+            }
+
+            unlock_iovec(remote_vec, arg4, arg5, is_write);
+            unlock_iovec(local_vec, arg2, arg3, !is_write);
+        }
+        return ret;
+#endif
 #if defined(TARGET_NR_preadv)
     case TARGET_NR_preadv:
         {
@@ -10651,7 +11187,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 unsigned long low, high;
 
                 target_to_host_low_high(arg4, arg5, &low, &high);
-                ret = get_errno(safe_preadv(arg1, vec, arg3, low, high));
+                if (qdmsan_should_virtualize_entropy_fd(arg1)) {
+                    ret = qdmsan_fill_fixed_rand_iovec(vec, arg3);
+                } else {
+                    ret = get_errno(safe_preadv(arg1, vec, arg3, low, high));
+                }
                 unlock_iovec(vec, arg2, arg3, 1);
             } else {
                 ret = -host_to_target_errno(errno);
@@ -11151,7 +11691,12 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                 return -TARGET_EFAULT;
             }
         }
-        ret = get_errno(pread64(arg1, p, arg3, target_offset64(arg4, arg5)));
+        if (p && qdmsan_should_virtualize_entropy_fd(arg1)) {
+            qdmsan_fill_fixed_rand_bytes(p, arg3);
+            ret = arg3;
+        } else {
+            ret = get_errno(pread64(arg1, p, arg3, target_offset64(arg4, arg5)));
+        }
         unlock_user(p, arg2, ret);
         return ret;
     case TARGET_NR_pwrite64:
@@ -11194,6 +11739,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         }
         header.version = tswap32(target_header->version);
         header.pid = tswap32(target_header->pid);
+        int target_cap_pid = header.pid;
+        if (use_qdmsan) {
+            header.pid = qdmsan_synth_to_real_pid(header.pid);
+        }
 
         if (header.version != _LINUX_CAPABILITY_VERSION) {
             /* Version 2 and up takes pointer to two user_data structs */
@@ -11232,6 +11781,9 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 
         /* The kernel always updates version for both capget and capset */
         target_header->version = tswap32(header.version);
+        if (use_qdmsan) {
+            target_header->pid = tswap32(target_cap_pid);
+        }
         unlock_user_struct(target_header, arg1, 1);
 
         if (arg2) {
@@ -11338,7 +11890,13 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg1))) {
             return -TARGET_EFAULT;
         }
-        ret = get_errno(stat(path(p), &st));
+        {
+            char translated[PATH_MAX];
+            const char *stat_path =
+                qdmsan_translate_proc_pid_path(p, translated,
+                                               sizeof(translated));
+            ret = get_errno(stat(path(stat_path), &st));
+        }
         unlock_user(p, arg1, 0);
         if (!is_error(ret))
             ret = host_to_target_stat64(cpu_env, arg2, &st);
@@ -11349,7 +11907,13 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg1))) {
             return -TARGET_EFAULT;
         }
-        ret = get_errno(lstat(path(p), &st));
+        {
+            char translated[PATH_MAX];
+            const char *stat_path =
+                qdmsan_translate_proc_pid_path(p, translated,
+                                               sizeof(translated));
+            ret = get_errno(lstat(path(stat_path), &st));
+        }
         unlock_user(p, arg1, 0);
         if (!is_error(ret))
             ret = host_to_target_stat64(cpu_env, arg2, &st);
@@ -11372,7 +11936,13 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         if (!(p = lock_user_string(arg2))) {
             return -TARGET_EFAULT;
         }
-        ret = get_errno(fstatat(arg1, path(p), &st, arg4));
+        {
+            char translated[PATH_MAX];
+            const char *stat_path =
+                qdmsan_translate_proc_pid_path(p, translated,
+                                               sizeof(translated));
+            ret = get_errno(fstatat(arg1, path(stat_path), &st, arg4));
+        }
         unlock_user(p, arg2, 0);
         if (!is_error(ret))
             ret = host_to_target_stat64(cpu_env, arg3, &st);
@@ -11396,8 +11966,13 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
                  */
                 struct target_statx host_stx;
                 int mask = arg4;
+                char translated[PATH_MAX];
+                const char *stat_path =
+                    qdmsan_translate_proc_pid_path(p, translated,
+                                                   sizeof(translated));
 
-                ret = get_errno(sys_statx(dirfd, p, flags, mask, &host_stx));
+                ret = get_errno(sys_statx(dirfd, stat_path, flags, mask,
+                                          &host_stx));
                 if (!is_error(ret)) {
                     if (host_to_target_statx(&host_stx, arg5) != 0) {
                         unlock_user(p, arg2, 0);
@@ -12051,7 +12626,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
         return TARGET_PAGE_SIZE;
 #endif
     case TARGET_NR_gettid:
-        return get_errno(sys_gettid());
+        return use_qdmsan ? qdmsan_self_synth_pid : get_errno(sys_gettid());
 #ifdef TARGET_NR_readahead
     case TARGET_NR_readahead:
 #if TARGET_ABI_BITS == 32
@@ -12299,7 +12874,18 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_clock_gettime:
     {
         struct timespec ts;
-        ret = get_errno(clock_gettime(arg1, &ts));
+        if (use_qdmsan) {
+            ret = get_errno(clock_getres(arg1, NULL));
+            if (is_error(ret)) return ret;
+            ts.tv_sec = (time_t)qdmsan_fixed_time_sec_next();
+            ts.tv_nsec = (long)(__qdmsan_qemu_map
+                                     ? __qdmsan_qemu_map->fixed_time_usec
+                                     : 0) *
+                         1000L;
+            ret = 0;
+        } else {
+            ret = get_errno(clock_gettime(arg1, &ts));
+        }
         if (!is_error(ret)) {
             ret = host_to_target_timespec(arg2, &ts);
         }
@@ -12310,7 +12896,18 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_clock_gettime64:
     {
         struct timespec ts;
-        ret = get_errno(clock_gettime(arg1, &ts));
+        if (use_qdmsan) {
+            ret = get_errno(clock_getres(arg1, NULL));
+            if (is_error(ret)) return ret;
+            ts.tv_sec = (time_t)qdmsan_fixed_time_sec_next();
+            ts.tv_nsec = (long)(__qdmsan_qemu_map
+                                     ? __qdmsan_qemu_map->fixed_time_usec
+                                     : 0) *
+                         1000L;
+            ret = 0;
+        } else {
+            ret = get_errno(clock_gettime(arg1, &ts));
+        }
         if (!is_error(ret)) {
             ret = host_to_target_timespec64(arg2, &ts);
         }
@@ -12321,9 +12918,17 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_clock_getres:
     {
         struct timespec ts;
-        ret = get_errno(clock_getres(arg1, &ts));
-        if (!is_error(ret)) {
-            host_to_target_timespec(arg2, &ts);
+        if (use_qdmsan) {
+            ret = get_errno(clock_getres(arg1, NULL));
+            if (is_error(ret)) return ret;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 1;
+            ret = 0;
+        } else {
+            ret = get_errno(clock_getres(arg1, &ts));
+        }
+        if (!is_error(ret) && arg2) {
+            ret = host_to_target_timespec(arg2, &ts);
         }
         return ret;
     }
@@ -12332,9 +12937,17 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
     case TARGET_NR_clock_getres_time64:
     {
         struct timespec ts;
-        ret = get_errno(clock_getres(arg1, &ts));
-        if (!is_error(ret)) {
-            host_to_target_timespec64(arg2, &ts);
+        if (use_qdmsan) {
+            ret = get_errno(clock_getres(arg1, NULL));
+            if (is_error(ret)) return ret;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 1;
+            ret = 0;
+        } else {
+            ret = get_errno(clock_getres(arg1, &ts));
+        }
+        if (!is_error(ret) && arg2) {
+            ret = host_to_target_timespec64(arg2, &ts);
         }
         return ret;
     }
@@ -12387,7 +13000,8 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #endif
 
     case TARGET_NR_tkill:
-        return get_errno(safe_tkill((int)arg1, target_to_host_signal(arg2)));
+        return get_errno(safe_tkill(qdmsan_synth_to_real_pid((pid_t)arg1),
+                                    target_to_host_signal(arg2)));
 
     case TARGET_NR_tgkill:
         {
@@ -12400,7 +13014,10 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
           if(afl_forksrv_pid && afl_forksrv_pid == pid && sig == SIGABRT)
               pid = tgid = getpid();
 
-          return get_errno(safe_tgkill(pid, tgid, target_to_host_signal(sig)));
+          return get_errno(safe_tgkill(
+              qdmsan_synth_to_real_pid((pid_t)pid),
+              qdmsan_synth_to_real_pid((pid_t)tgid),
+              target_to_host_signal(sig)));
 
         }
 
@@ -13337,6 +13954,14 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
           return -TARGET_ENOSYS;
         }
 
+    case QDMSAN_FAKESYS_NR:
+        if (use_qdmsan) {
+          return qdmsan_actions_dispatcher(arg1, arg2, arg3, arg4);
+        } else {
+          fprintf(stderr, "QDMSAN syscall unsupported without enabling QDMSAN mode (AFL_USE_QDMSAN)\n");
+          return -TARGET_ENOSYS;
+        }
+
     default:
         qemu_log_mask(LOG_UNIMP, "Unsupported syscall: %d\n", num);
         return -TARGET_ENOSYS;
@@ -13368,6 +13993,9 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
 
     record_syscall_start(cpu, num, arg1,
                          arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+    if (use_qdmsan) {
+        qdmsan_record_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6);
+    }
 
     if (unlikely(qemu_loglevel_mask(LOG_STRACE))) {
         print_syscall(cpu_env, num, arg1, arg2, arg3, arg4, arg5, arg6);

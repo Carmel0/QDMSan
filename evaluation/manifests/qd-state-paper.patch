@@ -1,0 +1,179 @@
+diff --git a/utils/qdmsan-diff/qdmsan_diff.c b/utils/qdmsan-diff/qdmsan_diff.c
+index 2349bd76..7e84ea25 100644
+--- a/utils/qdmsan-diff/qdmsan_diff.c
++++ b/utils/qdmsan-diff/qdmsan_diff.c
+@@ -130,6 +130,7 @@ static void die_usage(const char *fmt, ...) {
+           "  -t <ms>         timeout per run (default: 5000)\n"
+           "  -C <n>          extra fast-mode diagnostic triplets (default: 0)\n"
+           "  -R <n>          full-mode report limit (default: 8)\n"
++          "  -S              coarse state oracle (compare edge coverage)\n"
+           "  -v              verbose\n"
+           "  -Q              quiet result output\n"
+           "  -h              show this help\n"
+@@ -690,6 +691,11 @@ static void save_snapshot(qdmsan_diff_ctx_t *ctx, int run) {
+       run == 1 ? &ctx->snap1 : run == 2 ? &ctx->snap2 : &ctx->snap3;
+   memcpy(fast_dst, ctx->fast_map, sizeof(*fast_dst));
+ 
++  if (ctx->state_oracle && ctx->trace_bits) {
++    u8 *cov_dst = run == 1 ? ctx->cov1 : run == 2 ? ctx->cov2 : ctx->cov3;
++    if (cov_dst) { memcpy(cov_dst, ctx->trace_bits, MAP_SIZE); }
++  }
++
+   if (ctx->feedback_map) {
+     u16 *aux_dst = run == 1 ? ctx->aux1 : run == 2 ? ctx->aux2 : ctx->aux3;
+     memcpy(aux_dst, ctx->feedback_map->site_map,
+@@ -715,6 +721,11 @@ static qdmsan_diff_result_t run_one(qdmsan_diff_ctx_t *ctx, u8 poison,
+ 
+   *ctx->poison_byte = poison;
+   clear_maps(ctx);
++  /* The coverage map carries hit counts forward between runs here, so the
++     state oracle clears it itself and each snapshot holds one run. */
++  if (ctx->state_oracle && ctx->trace_bits) {
++    memset(ctx->trace_bits, 0, MAP_SIZE);
++  }
+   write_replay_input(ctx);
+ 
+   fsrv_run_result_t ret =
+@@ -760,6 +771,60 @@ static qdmsan_diff_result_t run_and_save(qdmsan_diff_ctx_t *ctx, int run,
+ 
+ }
+ 
++/* Coarse state oracle. The two fills and the repeat run are the same ones the
++   checkpoint oracle uses, so only the compared quantity changes. An edge whose
++   hit bucket moves with the fill and returns on the repeat marks a poison
++   dependent divergence, while an edge that differs between the two runs that
++   share a fill marks execution noise. */
++/* AFL hit count bucketing. Comparing raw counters would call a loop that runs
++   a few more times a divergence, so the state oracle compares the same
++   bucketed classes a coverage guided fuzzer stores. */
++static u8 cov_bucket(u8 v) {
++
++  if (v == 0) { return 0; }
++  if (v == 1) { return 1; }
++  if (v == 2) { return 2; }
++  if (v == 3) { return 4; }
++  if (v <= 7) { return 8; }
++  if (v <= 15) { return 16; }
++  if (v <= 31) { return 32; }
++  if (v <= 127) { return 64; }
++  return 128;
++
++}
++
++static qdmsan_diff_result_t cov_maps_verdict(const qdmsan_diff_ctx_t *ctx,
++                                             const u8 *m1, const u8 *m2,
++                                             const u8 *m3) {
++
++  if (!m1 || !m2 || !m3) { return QDMSAN_DIFF_CLEAN; }
++
++  u8  any_nondet = 0;
++  u32 live = 0, diff_fill = 0, diff_repeat = 0;
++
++  for (u32 i = 0; i < MAP_SIZE; ++i) {
++    u8 v1 = cov_bucket(m1[i]);
++    u8 v2 = cov_bucket(m2[i]);
++    u8 v3 = cov_bucket(m3[i]);
++    if (!(v1 | v2 | v3)) { continue; }
++    ++live;
++    if (v1 != v2) { ++diff_fill; }
++    if (v1 != v3) {
++      ++diff_repeat;
++      any_nondet = 1;
++    }
++  }
++
++  if (ctx && ctx->verbose) {
++    printf("  state: live=%u fill_diff=%u repeat_diff=%u\n", live, diff_fill,
++           diff_repeat);
++  }
++
++  if (!any_nondet && diff_fill) { return QDMSAN_DIFF_BUG; }
++  return any_nondet ? QDMSAN_DIFF_NONDET : QDMSAN_DIFF_CLEAN;
++
++}
++
+ static qdmsan_diff_result_t aux_maps_verdict(const u16 *m1, const u16 *m2,
+                                              const u16 *m3) {
+ 
+@@ -951,13 +1016,19 @@ qdmsan_diff_result_t qdmsan_diff_check(qdmsan_diff_ctx_t *ctx) {
+   r = run_and_save(ctx, 2, DMSAN_POISON_RUN2);
+   if (r != QDMSAN_DIFF_CLEAN) { return r; }
+ 
+-  if (signatures_equal(&ctx->snap1, &ctx->snap2)) {
++  /* The state oracle needs the repeat run even when the digests agree, since
++     its verdict comes from coverage rather than from those digests. */
++  if (!ctx->state_oracle && signatures_equal(&ctx->snap1, &ctx->snap2)) {
+     return QDMSAN_DIFF_CLEAN;
+   }
+ 
+   r = run_and_save(ctx, 3, DMSAN_POISON_RUN3);
+   if (r != QDMSAN_DIFF_CLEAN) { return r; }
+ 
++  if (ctx->state_oracle) {
++    return cov_maps_verdict(ctx, ctx->cov1, ctx->cov2, ctx->cov3);
++  }
++
+   /* The three fast-map planes are the online oracle in every mode. Full mode
+      additionally populates localization statistics but cannot hide a pure
+      OOB/UAF fast-plane finding. */
+@@ -1218,6 +1289,12 @@ static void setup_forkserver(qdmsan_diff_ctx_t *ctx, const char *input_file) {
+   if (!ctx->trace_bits) { PFATAL("AFL shared memory init failed"); }
+ 
+   ctx->fsrv.trace_bits = ctx->trace_bits;
++
++  if (ctx->state_oracle) {
++    ctx->cov1 = ck_alloc(MAP_SIZE);
++    ctx->cov2 = ck_alloc(MAP_SIZE);
++    ctx->cov3 = ck_alloc(MAP_SIZE);
++  }
+   ctx->fsrv.map_size = MAP_SIZE;
+   ctx->fsrv.real_map_size = MAP_SIZE;
+   ctx->fsrv.target_path = (u8 *)ctx->qemu_path;
+@@ -1262,6 +1339,10 @@ void qdmsan_diff_cleanup(qdmsan_diff_ctx_t *ctx) {
+     ctx->trace_bits = NULL;
+   }
+ 
++  if (ctx->cov1) { ck_free(ctx->cov1); ctx->cov1 = NULL; }
++  if (ctx->cov2) { ck_free(ctx->cov2); ctx->cov2 = NULL; }
++  if (ctx->cov3) { ck_free(ctx->cov3); ctx->cov3 = NULL; }
++
+   if (ctx->input_fd >= 0) {
+     close(ctx->input_fd);
+     ctx->input_fd = -1;
+@@ -1372,7 +1453,7 @@ int main(int argc, char **argv) {
+   const char *input_file = NULL;
+ 
+   int opt;
+-  while ((opt = getopt(argc, argv, "+q:l:m:c:i:t:C:R:vQh")) != -1) {
++  while ((opt = getopt(argc, argv, "+q:l:m:c:i:t:C:R:SvQh")) != -1) {
+     switch (opt) {
+       case 'q':
+         ctx.qemu_path = xstrdup0(optarg);
+@@ -1398,6 +1479,9 @@ int main(int argc, char **argv) {
+       case 'R':
+         ctx.report_limit = (u32)strtoul(optarg, NULL, 10);
+         break;
++      case 'S':
++        ctx.state_oracle = 1;
++        break;
+       case 'v':
+         ctx.verbose = 1;
+         break;
+diff --git a/utils/qdmsan-diff/qdmsan_diff.h b/utils/qdmsan-diff/qdmsan_diff.h
+index d703032e..5819bf52 100644
+--- a/utils/qdmsan-diff/qdmsan_diff.h
++++ b/utils/qdmsan-diff/qdmsan_diff.h
+@@ -98,6 +98,13 @@ typedef struct qdmsan_diff_ctx {
+   struct dmsan_fast_map snap2;
+   struct dmsan_fast_map snap3;
+ 
++  /* Coarse state oracle. Same poisoning and same three runs, but the verdict
++     compares edge coverage instead of checkpoint digests. */
++  u8 state_oracle;
++  u8 *cov1;
++  u8 *cov2;
++  u8 *cov3;
++
+   u16 *aux1;
+   u16 *aux2;
+   u16 *aux3;

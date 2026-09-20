@@ -166,6 +166,18 @@ void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
   afl->virgin_bits = ck_realloc(afl->virgin_bits, new_size);
   afl->virgin_tmout = ck_realloc(afl->virgin_tmout, new_size);
   afl->virgin_crash = ck_realloc(afl->virgin_crash, new_size);
+  if (afl->virgin_dmsan) {
+    afl->virgin_dmsan = ck_realloc(afl->virgin_dmsan, new_size);
+  }
+  if (afl->virgin_msan_only) {
+    afl->virgin_msan_only = ck_realloc(afl->virgin_msan_only, new_size);
+  }
+  if (afl->virgin_dmsan_only) {
+    afl->virgin_dmsan_only = ck_realloc(afl->virgin_dmsan_only, new_size);
+  }
+
+  if (afl->dmsan_enabled) { dmsan_ensure_trace_scratch(afl, new_size); }
+
   afl->var_bytes = ck_realloc(afl->var_bytes, new_size);
   afl->top_rated = ck_realloc(afl->top_rated, new_size * sizeof(void *));
   afl->clean_trace = ck_realloc(afl->clean_trace, new_size);
@@ -183,6 +195,15 @@ void afl_resize_map_buffers(afl_state_t *afl, u32 old_size, u32 new_size) {
     memset(afl->clean_trace_custom + old_size, 0, size_diff);
     memset(afl->first_trace + old_size, 0, size_diff);
     memset(afl->map_tmp_buf + old_size, 0, size_diff);
+    if (afl->virgin_msan_only) {
+      memset(afl->virgin_msan_only + old_size, 255, size_diff);
+    }
+    if (afl->virgin_dmsan_only) {
+      memset(afl->virgin_dmsan_only + old_size, 255, size_diff);
+    }
+    if (afl->virgin_dmsan) {
+      memset(afl->virgin_dmsan + old_size, 255, size_diff);
+    }
 
   }
 

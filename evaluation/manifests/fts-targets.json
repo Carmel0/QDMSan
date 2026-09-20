@@ -1,0 +1,95 @@
+[
+  {
+    "name": "libxml2-v2.9.2",
+    "binary": "fuzz_target",
+    "binary_sha256": "89aa11e42921744d416eca65beb2d6047dbe03a7ffbf1aa10c60cf0198908041",
+    "memcheck_binary": "fuzz_target.memcheck",
+    "argv": [
+      "@@"
+    ],
+    "input_passing": "file argument (oneshot_driver.cc reads argv[1], calls LLVMFuzzerTestOneInput once, exits)",
+    "cwd_needs": [],
+    "runtime_dir": null,
+    "dict": "xml.dict",
+    "dict_sha256": "eb489d1baf507bc1cff64e3132945e0eb8dd8693d3dc4869ce015162bd1c8c7c",
+    "max_len_G": 64
+  },
+  {
+    "name": "pcre2-10.00",
+    "binary": "fuzz_target",
+    "binary_sha256": "d96ed30bb5488b3fdd4b7288a8f73098e45100d92b66158e19ec127f5de843f0",
+    "memcheck_binary": "fuzz_target.memcheck",
+    "argv": [
+      "@@"
+    ],
+    "input_passing": "file argument (oneshot_driver.cc reads argv[1], calls LLVMFuzzerTestOneInput once, exits)",
+    "cwd_needs": [],
+    "runtime_dir": null,
+    "dict": null,
+    "dict_sha256": null,
+    "max_len_G": null
+  },
+  {
+    "name": "re2-2014-12-09",
+    "binary": "fuzz_target",
+    "binary_sha256": "84c455a56239f3e238a12e3690cb6a75d2a84c001e61a580bfca5532ce09b428",
+    "memcheck_binary": "fuzz_target.memcheck",
+    "argv": [
+      "@@"
+    ],
+    "input_passing": "file argument (oneshot_driver.cc reads argv[1], calls LLVMFuzzerTestOneInput once, exits)",
+    "cwd_needs": [],
+    "runtime_dir": null,
+    "dict": null,
+    "dict_sha256": null,
+    "max_len_G": null
+  },
+  {
+    "name": "openssl-1.0.1f",
+    "binary": "fuzz_target",
+    "binary_sha256": "321af7a3b2b01fc27f3a2e57129a0f705c7ee4f1b369ce1da91d98a02602e045",
+    "memcheck_binary": "fuzz_target.memcheck",
+    "argv": [
+      "@@"
+    ],
+    "input_passing": "file argument (oneshot_driver.cc reads argv[1], calls LLVMFuzzerTestOneInput once, exits)",
+    "cwd_needs": [
+      "runtime/server.pem",
+      "runtime/server.key"
+    ],
+    "runtime_dir": "runtime",
+    "dict": null,
+    "dict_sha256": null,
+    "max_len_G": null
+  },
+  {
+    "name": "json-2017-02-12",
+    "binary": "fuzz_target",
+    "binary_sha256": "0649d8c8582907db40dbeddac5d4e9a875982bd050af354d2148ce039d01b5fe",
+    "memcheck_binary": "fuzz_target.memcheck",
+    "argv": [
+      "@@"
+    ],
+    "input_passing": "file argument (oneshot_driver.cc reads argv[1], calls LLVMFuzzerTestOneInput once, exits)",
+    "cwd_needs": [],
+    "runtime_dir": null,
+    "dict": null,
+    "dict_sha256": null,
+    "max_len_G": null
+  },
+  {
+    "name": "guetzli-2017-3-30",
+    "binary": "fuzz_target",
+    "binary_sha256": "461c2895c5c3878be47b2cdfeb5a12a639308c592720eeb5fae2c458628450c1",
+    "memcheck_binary": "fuzz_target.memcheck",
+    "argv": [
+      "@@"
+    ],
+    "input_passing": "file argument (oneshot_driver.cc reads argv[1], calls LLVMFuzzerTestOneInput once, exits)",
+    "cwd_needs": [],
+    "runtime_dir": null,
+    "dict": "jpeg.dict",
+    "dict_sha256": "1a9d5f385e32025c6bec231af4c389844120e0bf28a05de54c7a3a94be10200c",
+    "max_len_G": 180
+  }
+]

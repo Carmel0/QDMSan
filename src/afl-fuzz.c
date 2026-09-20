@@ -271,7 +271,11 @@ static void usage(u8 *argv0, int more_help) {
       "times)\n"
       "  -w san_binary  - Specify the extra sanitizer instrumented binaries,\n"
       "                   can be specified multiple times.\n"
-      "                   Read docs/SAND.md for details.\n\n"
+      "                   Read docs/SAND.md for details.\n"
+      "  -j dmsan_binary - enable DMSAN differential testing with the specified\n"
+      "                   sidecar binary compiled with AFL_DMSAN_MODE=fast or\n"
+      "                   fast+aux (DEPLOY=sidecar).\n"
+      "                   Inline mode uses AFL_DMSAN_DEPLOY=inline and no -j.\n\n"
 
       "Test settings:\n"
       "  -s seed       - use a fixed seed for the RNG\n"
@@ -673,10 +677,10 @@ int main(int argc, char **argv_orig, char **envp) {
 
   afl->shmem_testcase_mode = 1;  // we always try to perform shmem fuzzing
 
-  // still available: HjJkqrv
+  // still available: HJkqrv
   while ((opt = getopt(
               argc, argv,
-              "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:K:l:L:m:M:nNo:Op:P:QRs:S:t:T:"
+              "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:j:K:l:L:m:M:nNo:Op:P:QRs:S:t:T:"
               "uUV:w:WXx:YzZ")) > 0) {
 
     switch (opt) {
@@ -903,6 +907,15 @@ int main(int argc, char **argv_orig, char **envp) {
         if (!strcmp(afl->in_dir, "-")) { afl->in_place_resume = 1; }
 
         break;
+
+      case 'j': {                                              /* DMSAN binary */
+
+        if (afl->dmsan_binary) { FATAL("Multiple -j options not supported"); }
+        afl->dmsan_binary = ck_strdup(optarg);
+
+        break;
+
+      }
 
       case 'o':                                               /* output dir */
 
@@ -2606,6 +2619,20 @@ int main(int argc, char **argv_orig, char **envp) {
 
   afl->argv = use_argv;
 
+  {
+    const char *deploy_env = getenv("AFL_DMSAN_DEPLOY");
+    if (getenv("AFL_QDMSAN_MODE")) {
+      deploy_env = getenv("AFL_QDMSAN_DEPLOY");
+      if (!deploy_env) { deploy_env = "inline"; }
+    }
+    if (deploy_env && !strcmp(deploy_env, "inline")) {
+
+      ACTF("Initializing inline DMSAN mode");
+      dmsan_integrated_init(afl);
+
+    }
+  }
+
   afl->fsrv.trace_bits =
       afl_shm_init(&afl->shm, afl->fsrv.map_size, afl->non_instrumented_mode,
                    afl->perm, afl->chown_needed ? afl->fsrv.gid : -1);
@@ -2642,6 +2669,7 @@ int main(int argc, char **argv_orig, char **envp) {
       setenv("AFL_NO_AUTODICT", "1", 1);  // loaded already
       afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
                      afl->afl_env.afl_debug_child);
+      if (afl->dmsan_inline_mode) { dmsan_read_sitemap(afl); }
 
       map_size = new_map_size;
 
@@ -2791,6 +2819,7 @@ int main(int argc, char **argv_orig, char **envp) {
         afl->san_fsrvs[i].map_size = afl->fsrv.map_size;
         afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
                        afl->afl_env.afl_debug_child);
+        if (afl->dmsan_inline_mode) { dmsan_read_sitemap(afl); }
         afl_fsrv_start(&afl->san_fsrvs[i], afl->argv, &afl->stop_soon,
                        afl->afl_env.afl_debug_child);
 
@@ -2803,6 +2832,15 @@ int main(int argc, char **argv_orig, char **envp) {
     OKF("All forkservers for extra sanitizers instrumented binaries are up and "
         "we have abstraction = %d",
         afl->san_abstraction);
+
+    /* Allocate virgin bitmaps for categorized finding dedup.
+       dmsan_init() allocates these when -j is present, but in SAND+MSAN-only
+       mode (-w without -j) dmsan_init() is never called -> NULL -> SIGSEGV in
+       classify block. Allocate here if not already done. */
+    if (!afl->virgin_msan_only) {
+      afl->virgin_msan_only  = ck_alloc(DEFAULT_SHMEM_SIZE);
+      afl->virgin_dmsan_only = ck_alloc(DEFAULT_SHMEM_SIZE);
+    }
 
   }
 
@@ -2857,12 +2895,43 @@ int main(int argc, char **argv_orig, char **envp) {
       afl->cmplog_fsrv.trace_bits = afl->fsrv.trace_bits;
       afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
                      afl->afl_env.afl_debug_child);
+      if (afl->dmsan_inline_mode) { dmsan_read_sitemap(afl); }
       afl_fsrv_start(&afl->cmplog_fsrv, afl->argv, &afl->stop_soon,
                      afl->afl_env.afl_debug_child);
 
     }
 
     OKF("CMPLOG forkserver successfully started");
+
+  }
+
+  /* Initialize DMSAN/QDMSAN sidecar if requested. */
+  if (afl->dmsan_binary ||
+      (getenv("AFL_QDMSAN_MODE") &&
+       getenv("AFL_QDMSAN_DEPLOY") &&
+       strcmp(getenv("AFL_QDMSAN_DEPLOY"), "inline"))) {
+
+    ACTF("Initializing differential memory sanitizer sidecar");
+    dmsan_init(afl);
+
+    if (afl->dmsan_enabled) {
+
+      ACTF("Spawning differential memory sanitizer forkserver");
+      afl_fsrv_start(&afl->dmsan_fsrv, afl->argv, &afl->stop_soon,
+                     afl->afl_env.afl_debug_child);
+      OKF("Differential memory sanitizer forkserver successfully started");
+      dmsan_read_sitemap(afl);
+
+      {
+
+        char *replay_path = getenv("AFL_DMSAN_REPLAY_FILE");
+        if (replay_path && *replay_path) {
+          dmsan_replay_single_file(afl, replay_path);
+        }
+
+      }
+
+    }
 
   }
 
@@ -3073,6 +3142,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
     afl_fsrv_start(&afl->fsrv, afl->argv, &afl->stop_soon,
                    afl->afl_env.afl_debug_child);
+    if (afl->dmsan_inline_mode) { dmsan_read_sitemap(afl); }
 
     // Restore AFL_NO_IJON for subsequent processes (cmplog/asan)
     if (need_restore_no_ijon) { setenv("AFL_NO_IJON", "1", 1); }
@@ -3128,7 +3198,11 @@ int main(int argc, char **argv_orig, char **envp) {
 
     memset(afl->virgin_tmout, 255, map_size);
     memset(afl->virgin_crash, 255, map_size);
-
+    if (afl->dmsan_enabled) { memset(afl->virgin_dmsan, 255, map_size); }
+    if (afl->virgin_msan_only) { memset(afl->virgin_msan_only, 255, map_size); }
+    if (afl->virgin_dmsan_only) {
+      memset(afl->virgin_dmsan_only, 255, map_size);
+    }
     if (likely(!afl->afl_env.afl_no_startup_calibration)) {
 
       perform_dry_run(afl);
@@ -3892,6 +3966,9 @@ stop_fuzzing:
   }
 
   if (afl->cmplog_binary) { afl_fsrv_deinit(&afl->cmplog_fsrv); }
+
+  /* Cleanup DMSAN */
+  if (afl->dmsan_enabled) { dmsan_deinit(afl); }
 
   /* remove tmpfile */
   if (!afl->in_place_resume && afl->fsrv.out_file) {

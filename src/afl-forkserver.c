@@ -431,6 +431,7 @@ static u32 __attribute__((hot)) read_s32_timed(s32 fd, s32 *buf, u32 timeout_ms,
 
   /* set exceptfds as well to return when a child exited/closed the pipe. */
 restart_poll:
+  if (*stop_soon_p) { return 0; }
   pret = poll(fds, nfds, timeout_ms);
   if (likely(pret > 0)) {
 
@@ -673,6 +674,8 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
   u32   status;
   s32   rlen;
   char *ignore_autodict = getenv("AFL_NO_AUTODICT");
+
+  if (*stop_soon_p) { return; }
 
 #ifdef __linux__
   if (unlikely(fsrv->nyx_mode)) {
@@ -1129,6 +1132,10 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
     u32 time_ms = read_s32_timed(fsrv->fsrv_st_fd, &status, fsrv->init_tmout,
                                  stop_soon_p);
 
+    /* A cancelled startup is not a target crash. The caller owns cleanup
+       and needs the still-recorded forkserver PID to reap/terminate it. */
+    if (*stop_soon_p) { return; }
+
     if (!time_ms) {
 
       s32 tmp_pid = fsrv->fsrv_pid;
@@ -1161,6 +1168,8 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
     rlen = read(fsrv->fsrv_st_fd, &status, 4);
 
   }
+
+  if (*stop_soon_p) { return; }
 
   /* If we have a four-byte "hello" message from the server, we're all set.
      Otherwise, try to figure out what went wrong. */

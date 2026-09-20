@@ -1,0 +1,40 @@
+origin	set	kind	path	source_ref	expected	check_mode	mode	compile_flags	link_flags	title
+local	TP	raw-result-policy	cases/tp/raw_cmp_operand_reports.c	qdmsan:raw_cmp_operand	report	raw	fast	-	-	Raw mode reports compare operands even when the compare result is unchanged
+local	TP	static-stack	cases/tp/static_stack_raw_reports.c	qdmsan:static_stack_poison	report	raw	fast	-static	-	Static no-preload target reports stack-poisoned compare from QEMU instrumentation
+local	TN	raw-result-policy	cases/tp/raw_cmp_operand_reports.c	qdmsan:result_cmp_result_clean	clean	result	fast	-	-	Result mode stays clean when only raw compare operands differ
+local	TP	branch-result	cases/tp/result_branch_reports.c	qdmsan:result_branch_report	report	result	fast	-	-	Result mode reports when poisoned data changes a consumed branch result
+local	TN	copy-no-sink	cases/tn/string_copy_no_sink_clean.c	qdmsan:string_copy_no_sink	clean	raw	fast	-	-	String-copy hooks suppress propagation-only reports
+local	TN	calloc-clean	cases/tn/calloc_branch_clean.c	qdmsan:calloc_clean	clean	raw	fast	-	-	calloc output remains initialized zero
+local	TN	nondet-libqdmsan-time	cases/nondet/time_clock_clean.c	libqdmsan:time/clock/gettimeofday/clock_gettime/clock_getres/ftime/times	clean	raw	fast	-	-	libqdmsan time hooks return deterministic fixed-base values
+local	TN	nondet-qemu-time	cases/nondet/syscall_time_clean.c	syscall.c:TARGET_NR_time/gettimeofday/clock_gettime/times	clean	raw	fast	-	-	QEMU direct time syscalls return deterministic fixed-base values
+local	TN	nondet-libqdmsan-prng	cases/nondet/prng_clean.c	libqdmsan:rand/random/*rand48/*_r seed hooks	clean	raw	fast	-	-	libqdmsan PRNG hooks return deterministic fixed-base values and ignore seeds
+local	TN	nondet-libqdmsan-entropy	cases/nondet/getrandom_clean.c	libqdmsan:getrandom/getentropy	clean	raw	fast	-	-	libqdmsan getrandom and getentropy hooks return deterministic bytes
+local	TN	nondet-qemu-getrandom	cases/nondet/syscall_getrandom_clean.c	syscall.c:TARGET_NR_getrandom	clean	raw	fast	-	-	QEMU direct getrandom syscall returns deterministic bytes
+local	TN	nondet-qemu-entropy-fd	cases/nondet/dev_urandom_clean.c	syscall.c:open/read/close entropy fd	clean	raw	fast	-	-	QEMU /dev/urandom read path is deterministic
+local	TN	nondet-qemu-entropy-fd	cases/nondet/entropy_fd_variants_clean.c	syscall.c:openat/readv/pread64/preadv/dup/dup2/fcntl	clean	raw	fast	-	-	QEMU entropy fd propagation and vector/pread paths are deterministic
+local	TN	nondet-qemu-guest-random	cases/nondet/at_random_clean.c	qemu_guest_getrandom:AT_RANDOM via QEMU_RAND_SEED	clean	raw	fast	-	-	QEMU-owned guest AT_RANDOM bytes are stable under qdmsan-diff seeding
+local	TN	nondet-qemu-pid	cases/nondet/pid_tid_clean.c	syscall.c:TARGET_NR_getpid/getppid/gettid	clean	raw	fast	-	-	pid/tid/ppid values are virtualized across QDMSAN runs
+local	TN	nondet-qemu-pid	cases/nondet/fork_wait_pid_clean.c	syscall.c:fork/waitpid/kill synthetic pid map	clean	raw	fast	-	-	fork child ids and wait results are synthetic and deterministic
+local	TN	nondet-qemu-procfs	cases/nondet/procfs_pid_clean.c	syscall.c:qdmsan_translate_proc_pid_path open/readlink/stat	clean	raw	fast	-	-	/proc/<synthetic-pid> paths translate to real pid paths
+local	TN	nondet-qemu-cap	cases/nondet/cap_pid_clean.c	syscall.c:TARGET_NR_capget pid translation	clean	raw	fast	-	-	capget accepts synthetic pid and restores it for guest state
+local	TN	nondet-qemu-process-vm	cases/nondet/process_vm_self_clean.c	syscall.c:process_vm_readv/process_vm_writev synthetic pid	clean	raw	fast	-	-	process_vm self operations translate synthetic pid and copy deterministically
+local	TN	nondet-qemu-x86-rng	cases/nondet/rdtsc_clean.c	target/i386:rdtsc/rdtscp/rdrand/rdseed helpers	clean	raw	fast	-	-	x86 timing and CPU RNG helpers return deterministic fixed-base values when available
+local	TN	nondet-qemu-sysv-shm	cases/nondet/sysv_shm_id_clean.c	syscall.c:shmget/shmat/shmctl synthetic shmid map	clean	raw	fast	-	-	SysV shm ids are canonicalized and shmat mappings stay initialized
+local	TN	nondet-libqdmsan-temp	cases/nondet/mkstemps_mkdtemp_clean.c	libqdmsan:mkstemps/mkostemps/mkdtemp deterministic suffixes	clean	raw	fast	-	-	libqdmsan deterministic temp suffix hooks keep temp names stable
+local	TN	nondet-libqdmsan-temp	cases/nondet/temp_path_unlink_clean.c	libqdmsan:open/openat/known temp path suppression and cleanup	clean	raw	fast	-	-	libqdmsan suppresses and cleans runtime-owned temp path probes
+local	TN	nondet-libqdmsan-temp-stat	cases/nondet/temp_stat_mtime_clean.c	libqdmsan:temp stat/fstat mtime normalization	clean	raw	fast	-	-	libqdmsan normalizes temp-file stat timestamps
+local	TN	nondet-rusage	cases/nondet/getrusage_clean.c	libqdmsan:getrusage and syscall.c:TARGET_NR_getrusage	clean	raw	fast	-	-	libqdmsan and QEMU direct getrusage return deterministic resource counters
+local	TN	nondet-sigmask-tail	cases/nondet/sigmask_tail_padding_clean.c	libqdmsan:sigprocmask/pthread_sigmask kernel sigset size	clean	raw	fast	-	-	libqdmsan ignores glibc sigset_t tail padding
+local	TN	nondet-sigaction-tail	cases/nondet/sigaction_mask_tail_padding_clean.c	libqdmsan:sigaction kernel sigset size	clean	raw	fast	-	-	libqdmsan sigaction reads only kernel sigset mask bytes
+local	TN	nondet-random-device	cases/nondet/random_device_clean.cc	libqdmsan:std::random_device mangled hooks	clean	raw	fast	-	-	libqdmsan controls libstdc++ random_device backends
+local	TP	full-origin	cases/tp/raw_cmp_operand_reports.c	qdmsan:full_origin_smoke	report	raw	full	-	-	Full mode reports a QDMSAN local TP
+local	TP	heap-oob-read	cases/tp/heap_oob_read_reports.c	qdmsan:oob_preload_read	report	raw	fast	-	-	Heap right-redzone read is detected by the OOB differential plane
+local	TP	heap-oob-write	cases/tp/heap_oob_write_reports.c	qdmsan:oob_pre_store	report	raw	fast	-	-	Write-only heap OOB is detected from the destination preimage
+local	TP	heap-oob-partial-write	cases/tp/heap_oob_partial_write_reports.c	qdmsan:oob_overlap_pre_store	report	raw	fast	-	-	A multi-byte store beginning in-bounds and crossing into the redzone is detected
+local	TP	heap-strdup-oob	cases/tp/heap_strdup_oob_reports.c	libqdmsan:strdup_transfer_redzone	report	raw	fast	-fno-builtin-strdup	-	Suppressed libc transfer internals still return a managed object with OOB redzones
+local	TP	heap-uaf-read	cases/tp/heap_uaf_read_reports.c	qdmsan:uaf_quarantine_read	report	raw	fast	-	-	Read from a quarantined heap object is detected by the UAF differential plane
+local	TP	heap-uaf-write	cases/tp/heap_uaf_write_reports.c	qdmsan:uaf_pre_store	report	raw	fast	-	-	Write-only heap UAF is detected from the destination preimage
+local	TP	three-planes	cases/tp/three_memory_planes_report.c	qdmsan:uum_oob_uaf_together	report	raw	fast	-	-	One 2+1 replay detects UUM OOB and UAF planes together
+local	TN	heap-in-bounds	cases/tn/heap_in_bounds_clean.c	qdmsan:heap_region_routing	clean	raw	fast	-	-	Initialized in-bounds heap accesses do not enter OOB or UAF planes
+local	TN	allocator-api	cases/tn/allocator_api_clean.c	libqdmsan:redzone_allocator_apis	clean	raw	fast	-	-	Redzone allocator preserves realloc alignment usable-size and calloc contracts
+local	TN	libc-nested-free	cases/tn/fclose_managed_buffer_clean.c	libqdmsan:fclose_managed_stdio_buffer	clean	raw	fast	-	-	A libc boundary may free a managed interior pointer while the interceptor recursion guard is active

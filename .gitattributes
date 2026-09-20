@@ -1,0 +1,2 @@
+evaluation/manifests/*.patch -whitespace
+repro/*.patch -whitespace

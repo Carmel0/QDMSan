@@ -309,11 +309,31 @@ void load_stats_file(afl_state_t *afl) {
 
       }
 
+      if (starts_with("saved_dmsan_findings", keystring)) {
+
+        /* Skip: restored from directory scan in dmsan_recover_findings_state */
+
+      }
+
+      if (starts_with("saved_msan_only", keystring)) {
+
+        /* Skip: restored from directory scan in dmsan_recover_findings_state */
+
+      }
+
+      if (starts_with("saved_dmsan_only", keystring)) {
+
+        /* Skip: restored from directory scan in dmsan_recover_findings_state */
+
+      }
+
     }
 
   }
 
   if (afl->saved_crashes) { write_crash_readme(afl); }
+
+  if (afl->dmsan_enabled) { dmsan_load_dedup_state(afl); }
 
   return;
 
@@ -496,6 +516,71 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
 
   }
 
+  if (afl->dmsan_enabled) {
+
+    fprintf(f,
+            "dmsan_checks      : %llu\n"
+            "dmsan_direct_checks : %llu\n"
+            "dmsan_probe_checks : %llu\n"
+            "dmsan_integrated_checks : %llu\n"
+            "dmsan_crosscheck_checks : %llu\n"
+            "dmsan_bugs        : %llu\n"
+            "dmsan_crashes     : %llu\n"
+            "dmsan_nondet      : %llu\n"
+            "dmsan_timeout     : %llu\n"
+            "dmsan_deduped     : %llu\n"
+            "dmsan_confirm_rej : %llu\n"
+            "dmsan_aux_novel   : %llu\n"
+            "dmsan_aux_rescues : %llu\n"
+            "dmsan_nondet_site_inputs : %llu\n"
+            "dmsan_nondet_site_polluted : %llu\n"
+            "dmsan_clean_cache_hits  : %llu\n"
+            "dmsan_clean_cache_ins   : %llu\n"
+            "dmsan_aux_cache_hits  : %llu\n"
+            "dmsan_aux_cache_total : %llu\n"
+            "dmsan_probe_runs  : %llu\n"
+            "dmsan_probe_prom  : %llu\n"
+            "dmsan_deploy      : %s\n"
+            "dmsan_aux_compiled : %u\n"
+            "dmsan_aux_feedback : %u\n"
+            "dmsan_aux_cache    : %u\n"
+            "dmsan_aux_nondet   : %u\n"
+            "saved_msan_only   : %llu\n"
+            "saved_dmsan_only  : %llu\n"
+            "saved_dmsan_findings : %llu\n",
+            (unsigned long long)afl->dmsan_total_checks,
+            (unsigned long long)afl->dmsan_direct_checks,
+            (unsigned long long)afl->dmsan_probe_checks,
+            (unsigned long long)afl->dmsan_integrated_checks,
+            (unsigned long long)afl->dmsan_crosscheck_checks,
+            (unsigned long long)afl->dmsan_bugs_found,
+            (unsigned long long)afl->dmsan_crashes,
+            (unsigned long long)afl->dmsan_nondets,
+            (unsigned long long)afl->dmsan_timeouts,
+            (unsigned long long)afl->dmsan_deduped_runs,
+            (unsigned long long)afl->dmsan_confirm_rejected,
+            (unsigned long long)afl->dmsan_aux_feedback_hits,
+            (unsigned long long)afl->dmsan_aux_rescues,
+            (unsigned long long)afl->dmsan_nondet_site_inputs,
+            (unsigned long long)afl->dmsan_nondet_site_polluted,
+            (unsigned long long)afl->dmsan_clean_cache_hits,
+            (unsigned long long)afl->dmsan_clean_cache_inserts,
+            (unsigned long long)afl->dmsan_aux_cache_hits,
+            (unsigned long long)(afl->dmsan_aux_cache_hits +
+                                 afl->dmsan_aux_cache_misses),
+            (unsigned long long)afl->dmsan_probe_runs,
+            (unsigned long long)afl->dmsan_probe_promotions,
+            afl->dmsan_inline_mode ? "inline" : "sidecar",
+            (unsigned)afl->dmsan_aux_compiled,
+            (unsigned)afl->dmsan_aux_feedback,
+            (unsigned)afl->dmsan_aux_cache,
+            (unsigned)afl->dmsan_aux_nondet,
+            (unsigned long long)afl->saved_msan_only,
+            (unsigned long long)afl->saved_dmsan_only,
+            (unsigned long long)afl->saved_dmsan_findings);
+
+  }
+
   /* ignore errors */
 
   if (afl->debug) {
@@ -526,6 +611,10 @@ void write_stats_file(afl_state_t *afl, u32 t_bytes, double bitmap_cvg,
 
   fclose(f);
   rename(fn_tmp, fn_final);
+
+  /* Keep sanitizer reports in sync with fuzzer_stats so experiment scripts
+  do not observe stale report.json values between saved findings. */
+  if (afl->dmsan_enabled) { dmsan_update_report(afl); }
 
 }
 

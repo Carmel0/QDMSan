@@ -78,6 +78,7 @@
 #include <sys/file.h>
 #include <sys/types.h>
 #include "asanfuzz.h"
+#include "dmsanfuzz.h"
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
     defined(__NetBSD__) || defined(__DragonFly__)
@@ -219,6 +220,7 @@ struct queue_entry {
       was_fuzzed,                       /* historical, but needed for MOpt  */
       passed_det,                       /* Deterministic stages passed?     */
       has_new_cov,                      /* Triggers new coverage?           */
+      has_new_dmsan_feedback,           /* Triggers new DMSAN feedback?     */
       var_behavior,                     /* Variable behavior?               */
       favored,                          /* Currently favored?               */
       fs_redundant,                     /* Marked as redundant in the fs?   */
@@ -619,7 +621,11 @@ typedef struct afl_state {
 
   u8 *virgin_bits,                      /* Regions yet untouched by fuzzing */
       *virgin_tmout,                    /* Bits we haven't seen in tmouts   */
-      *virgin_crash;                    /* Bits we haven't seen in crashes  */
+      *virgin_crash,                    /* Bits we haven't seen in crashes  */
+      *virgin_dmsan,                    /* Bits we haven't seen in DMSAN findings */
+      *virgin_msan_only,                /* Bits we haven't seen in msan_only findings */
+      *virgin_dmsan_only,               /* Bits we haven't seen in dmsan_only findings */
+      *virgin_dmsan_aux;                /* DMSAN aux (s2.5 site-class) novelty */
 
   double *alias_probability;            /* alias weighted probabilities     */
   u32    *alias_table;                /* alias weighted random lookup table */
@@ -660,6 +666,9 @@ typedef struct afl_state {
       total_tmouts,                     /* Total number of timeouts         */
       saved_tmouts,                     /* Timeouts with unique signatures  */
       saved_hangs,                      /* Hangs with unique signatures     */
+      saved_dmsan_findings,             /* DMSAN findings with unique signatures */
+      saved_msan_only,                  /* msan_only directory saves        */
+      saved_dmsan_only,                 /* dmsan_only directory saves       */
       last_crash_execs,                 /* Exec counter at last crash       */
       queue_cycle,                      /* Queue round counter              */
       cycles_wo_finds,                  /* Cycles without any new paths     */
@@ -759,6 +768,117 @@ typedef struct afl_state {
   u8               san_binary_length; /* 0 means extra san binaries not given */
   u32              san_case_status;
   enum SanitizerAbstraction san_abstraction;
+
+  /* DMSAN (Differential Memory Sanitizer) */
+  char             *dmsan_binary;         /* Path to DMSAN binary */
+  afl_forkserver_t  dmsan_fsrv;           /* DMSAN forkserver */
+  u8                dmsan_enabled;        /* Is DMSAN enabled? */
+  u8                qdmsan_enabled;       /* QEMU DMSAN backend */
+  u8                dmsan_full_mode;      /* Full/hash side map requested */
+  u8                dmsan_aux_compiled;   /* Binary built with MODE=fast+aux */
+  u8                dmsan_inline_mode;    /* DEPLOY=inline; main exec = Run1 */
+  u8                dmsan_checking;       /* Internal flag: in Run2/Run3 */
+  u8                dmsan_clean_cache_enabled; /* Opt-in exact-input clean cache */
+  u8                dmsan_debug_enabled; /* AFL_DMSAN_DEBUG master artifact flag */
+  u8                dmsan_debug_dump_sig; /* Save .sig sidecars for findings */
+  u8                dmsan_save_nondet;   /* Save nondet/reject debug inputs */
+  /* Independent aux roles. Each requires aux_compiled to produce a signal and
+     is controlled by its own AFL_DMSAN_AUX_* environment variable. */
+  u8                dmsan_aux_feedback;   /* AUX_FEEDBACK: queue scoring */
+  u8                dmsan_aux_cache;      /* AUX_CACHE: Run2-skip cache */
+  u8                dmsan_aux_nondet;     /* AUX_NONDET: nondet->bug rescue */
+  u8                dmsan_cal_reuse_enabled; /* inline calibration reuse, default 1 */
+  u8                dmsan_run3_dedup;        /* AFL_DMSAN_RUN3_DEDUP: skip Run3 if trace covered by virgin_dmsan (default 1) */
+  u32               dmsan_confirm_runs;      /* AFL_DMSAN_CONFIRM_RUNS: confirmation triplets before saving (default 1, 0=off) */
+
+  /* Inline calibration reuse. calibrate_case already runs the seed multiple
+     times, so cycles 0/1 can carry Run1/Run2 signatures and site-map snapshots
+     for the later DMSAN check. */
+  u8                dmsan_cal_have_sigs;  /* 1 = below snapshots are valid */
+  struct dmsan_fast_map *dmsan_cal_sig1;  /* poison=0x11 fast_map */
+  struct dmsan_fast_map *dmsan_cal_sig2;  /* poison=0x22 fast_map */
+  u16              *dmsan_cal_aux1;       /* poison=0x11 site_map */
+  u16              *dmsan_cal_aux2;       /* poison=0x22 site_map */
+  u8               *dmsan_n_fuzz;         /* Bitmap for simplified trace dedup */
+  u8               *dmsan_trace_backup;   /* Saved trace_bits for inline mode */
+  u64               dmsan_trace_backup_size; /* Allocated trace backup bytes */
+  u8               *dmsan_trace_scratch;  /* Simplified trace scratch buffer */
+  u64               dmsan_trace_scratch_size; /* Allocated scratch bytes */
+
+  /* DMSAN shared memory */
+  s32               dmsan_shm_fast_id;    /* Fast mode shm ID */
+  s32               dmsan_shm_feedback_id; /* Aux (s2.5 site_map) shm ID */
+  s32               dmsan_shm_full_id;    /* Full/hash event shm ID */
+  s32               dmsan_shm_poison_id;  /* Poison byte shm ID */
+  s32               dmsan_shm_sitemap_id; /* Full-mode sitemap shm ID */
+  u8               *dmsan_shm_fast;       /* Pointer to dmsan_fast_map */
+  u8               *dmsan_shm_feedback;   /* Pointer to dmsan_feedback_shm */
+  u8               *dmsan_shm_full;       /* Pointer to dmsan_full_shm */
+  u8               *dmsan_shm_poison;     /* Pointer to poison byte */
+  struct dmsan_sitemap_entry *dmsan_shm_sitemap_ptr; /* Parent attachment */
+  struct dmsan_sitemap_entry *dmsan_sitemap; /* Local copy after forkserver */
+  u32               dmsan_sitemap_count;  /* Valid sitemap entries */
+
+  /* DMSAN per-run snapshots (local memory) */
+  struct dmsan_fast_map *dmsan_snapshot1;
+  struct dmsan_fast_map *dmsan_snapshot2;
+  struct dmsan_fast_map *dmsan_snapshot3;
+  u16               *dmsan_aux_snapshot1; /* site_map after Run1 */
+  u16               *dmsan_aux_snapshot2; /* site_map after Run2 */
+  u16               *dmsan_aux_snapshot3; /* site_map after Run3 */
+
+  /* DMSAN statistics */
+  u64               dmsan_total_checks;   /* Total differential checks */
+  u64               dmsan_direct_checks;  /* Sidecar direct checks from primary trigger */
+  u64               dmsan_probe_checks;   /* Full checks reached from probe promotion */
+  u64               dmsan_integrated_checks; /* Checks completed in inline mode */
+  u64               dmsan_crosscheck_checks; /* Supplemental MSan cross-class checks */
+  u64               dmsan_bugs_found;     /* BUG_FOUND count */
+  u64               dmsan_crashes;        /* CRASH count */
+  u64               dmsan_nondets;        /* NON_DETERMINISTIC count */
+  u64               dmsan_timeouts;       /* DMSAN_TIMEOUT count */
+  u64               dmsan_deduped_runs;      /* Run3 skipped via virgin_dmsan pre-check */
+  u64               dmsan_confirm_rejected;  /* BUG_FOUND downgraded by confirmation triplet */
+  u64               dmsan_aux_rescues;    /* sig=NONDET to aux=BUG upgrades */
+  u64               dmsan_next_finding_id; /* Next monotonically assigned finding id */
+  u64               msan_only_next_id;   /* Next monotonic msan_only id */
+  u64               dmsan_only_next_id;  /* Next monotonic dmsan_only id */
+  u64               dmsan_aux_feedback_hits; /* Run1 aux site novelty count */
+  u64               dmsan_nondet_site_inputs; /* NONDET inputs with stable local sites */
+  u64               dmsan_nondet_site_polluted; /* Accumulated unstable local sites */
+  u64               dmsan_clean_cache_hits; /* Exact-input clean-cache hits */
+  u64               dmsan_clean_cache_inserts; /* Exact-input clean-cache inserts */
+  u64               dmsan_aux_cache_hits;   /* Run2 skipped via aux cache */
+  u64               dmsan_aux_cache_misses; /* Run2 executed after aux cache lookup */
+  u64               dmsan_aux_cache_inserts; /* Clean Run1 observations cached */
+  u64               dmsan_probe_runs;     /* Run1-only old-path probes */
+  u64               dmsan_probe_promotions; /* Probes escalated to full diff */
+  u8                dmsan_last_aux_novelty; /* Run1 aux site novelty flag */
+  u32               dmsan_last_aux_stable_sites;   /* NONDET local rescue hint */
+  u32               dmsan_last_aux_unstable_sites; /* NONDET local pollution */
+  u32               dmsan_clean_cache_max; /* Exact-input clean-cache size */
+  u32               dmsan_clean_cache_next; /* Round-robin eviction cursor */
+  struct dmsan_clean_cache_entry *dmsan_clean_cache; /* Exact-input clean cache */
+  struct dmsan_aux_cache_entry *dmsan_aux_cache_table; /* Aux Run2-skip cache */
+  u8               *dmsan_probe_counts;   /* Old-path Run1 probe schedule */
+
+  /* DMSAN determinism support */
+  u64               dmsan_fixed_time_sec;
+  u64               dmsan_fixed_time_usec;
+  u64               dmsan_fixed_rand_base;
+  u64               dmsan_fixed_tsc_base;
+  u64               dmsan_fixed_rdrand_base;
+
+  /* DMSAN current finding (temporary storage) */
+  struct {
+
+    s32 crash_run;
+    s32 crash_signal;
+    u8  candidate_mask; /* QDMSAN_PLANE_*: Run1 differs from Run2 */
+    u8  confirmed_mask; /* candidate and Run1 equals Run3 */
+    u8  nondet_mask;    /* candidate and Run1 differs from Run3 */
+
+  } dmsan_current_finding;
 
   /* Custom mutators */
   struct custom_mutator *mutator;
@@ -1242,6 +1362,7 @@ u8 *describe_op(afl_state_t *, u8, size_t);
 #endif
 u8 save_if_interesting(afl_state_t *, void *, u32, u8);
 u8 has_new_bits(afl_state_t *, u8 *);
+u8 has_new_bits_in(afl_state_t *, u8 *, u8 *);
 #ifndef AFL_SHOWMAP
 void classify_counts(afl_forkserver_t *);
 #endif

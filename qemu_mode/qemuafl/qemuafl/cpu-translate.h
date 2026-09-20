@@ -32,6 +32,7 @@
  */
 
 #include "common.h"
+#include "qdmsan-qemu.h"
 #include "tcg/tcg.h"
 #include "tcg/tcg-op.h"
 
@@ -42,6 +43,123 @@ uint32_t afl_hash_ip(uint64_t);
 #else
   #define _DEFAULT_MO MO_32
 #endif
+
+static inline int qdmsan_gen_should_emit(target_ulong cur_loc) {
+  return __qdmsan_qemu_map && qdmsan_should_emit_tcg_event(cur_loc);
+}
+
+/*
+ * qdmsan_gen_checkpoint — TCG-level icmp checkpoint for CMP/SUB.
+ * Records both operands via QDMSAN fast/full event helpers.
+ * Emitted only with a fast map and a permitted main-program instruction.
+ */
+static void qdmsan_gen_checkpoint(target_ulong cur_loc, TCGv arg1, TCGv arg2,
+                                   MemOp ot) {
+  if (!qdmsan_gen_should_emit(cur_loc)) return;
+  TCGv cur_loc_v = tcg_const_tl(cur_loc);
+  switch (ot & MO_SIZE) {
+    case MO_64: gen_helper_qdmsan_checkpoint_64(cur_loc_v, arg1, arg2); break;
+    case MO_32: gen_helper_qdmsan_checkpoint_32(cur_loc_v, arg1, arg2); break;
+    case MO_16: gen_helper_qdmsan_checkpoint_16(cur_loc_v, arg1, arg2); break;
+    default:    gen_helper_qdmsan_checkpoint_8(cur_loc_v, arg1, arg2);  break;
+  }
+  tcg_temp_free(cur_loc_v);
+}
+
+static void qdmsan_gen_checkpoint_imm(target_ulong cur_loc, TCGv arg,
+                                       TCGv imm, MemOp ot) {
+  if (!qdmsan_gen_should_emit(cur_loc)) return;
+  TCGv cur_loc_v = tcg_const_tl(cur_loc);
+  switch (ot & MO_SIZE) {
+    case MO_64: gen_helper_qdmsan_checkpoint_imm_64(cur_loc_v, arg, imm); break;
+    case MO_32: gen_helper_qdmsan_checkpoint_imm_32(cur_loc_v, arg, imm); break;
+    case MO_16: gen_helper_qdmsan_checkpoint_imm_16(cur_loc_v, arg, imm); break;
+    default:    gen_helper_qdmsan_checkpoint_imm_8(cur_loc_v, arg, imm);  break;
+  }
+  tcg_temp_free(cur_loc_v);
+}
+
+/*
+ * qdmsan_gen_and_checkpoint — AND/TEST: skip if either operand is 0
+ * (absorbing element: 0 AND x == 0 regardless of x).
+ */
+static void qdmsan_gen_and_checkpoint(target_ulong cur_loc, TCGv arg1,
+                                       TCGv arg2, MemOp ot) {
+  if (!qdmsan_gen_should_emit(cur_loc)) return;
+  TCGv cur_loc_v = tcg_const_tl(cur_loc);
+  switch (ot & MO_SIZE) {
+    case MO_64: gen_helper_qdmsan_and_checkpoint_64(cur_loc_v, arg1, arg2); break;
+    case MO_32: gen_helper_qdmsan_and_checkpoint_32(cur_loc_v, arg1, arg2); break;
+    case MO_16: gen_helper_qdmsan_and_checkpoint_16(cur_loc_v, arg1, arg2); break;
+    default:    gen_helper_qdmsan_and_checkpoint_8(cur_loc_v, arg1, arg2);  break;
+  }
+  tcg_temp_free(cur_loc_v);
+}
+
+static void qdmsan_gen_and_checkpoint_imm(target_ulong cur_loc, TCGv arg,
+                                           TCGv imm, MemOp ot) {
+  if (!qdmsan_gen_should_emit(cur_loc)) return;
+  TCGv cur_loc_v = tcg_const_tl(cur_loc);
+  switch (ot & MO_SIZE) {
+    case MO_64: gen_helper_qdmsan_and_checkpoint_imm_64(cur_loc_v, arg, imm); break;
+    case MO_32: gen_helper_qdmsan_and_checkpoint_imm_32(cur_loc_v, arg, imm); break;
+    case MO_16: gen_helper_qdmsan_and_checkpoint_imm_16(cur_loc_v, arg, imm); break;
+    default:    gen_helper_qdmsan_and_checkpoint_imm_8(cur_loc_v, arg, imm);  break;
+  }
+  tcg_temp_free(cur_loc_v);
+}
+
+/*
+ * qdmsan_gen_ucomis_checkpoint — emit TCG call after ucomiss/ucomisd/comiss/comisd.
+ * The helper reads env->cc_src (set by the SSE compare helper to one of four
+ * EFLAGS values) and records it as the checkpoint value.
+ */
+static void qdmsan_gen_ucomis_checkpoint(target_ulong cur_loc) {
+  if (!qdmsan_gen_should_emit(cur_loc)) return;
+  TCGv cur_loc_v = tcg_const_tl(cur_loc);
+  gen_helper_qdmsan_ucomis_checkpoint(cur_loc_v, cpu_env);
+  tcg_temp_free(cur_loc_v);
+}
+
+static void qdmsan_gen_value_checkpoint(target_ulong cur_loc, TCGv value,
+                                         target_ulong kind) {
+  if (!qdmsan_gen_should_emit(cur_loc)) return;
+  TCGv cur_loc_v = tcg_const_tl(cur_loc);
+  TCGv kind_v = tcg_const_tl(kind);
+  gen_helper_qdmsan_value_checkpoint(cur_loc_v, value, kind_v);
+  tcg_temp_free(kind_v);
+  tcg_temp_free(cur_loc_v);
+}
+
+static void qdmsan_gen_ptr_checkpoint(target_ulong cur_loc, TCGv value,
+                                       target_ulong kind) {
+  if (!qdmsan_pointer_checks_enabled || !qdmsan_gen_should_emit(cur_loc)) return;
+  TCGv cur_loc_v = tcg_const_tl(cur_loc);
+  TCGv kind_v = tcg_const_tl(kind);
+  gen_helper_qdmsan_ptr_checkpoint(cur_loc_v, value, kind_v);
+  tcg_temp_free(kind_v);
+  tcg_temp_free(cur_loc_v);
+}
+
+/*
+ * qdmsan_gen_stack_alloc — emit TCG call to fill [new_sp, old_sp) with magic.
+ * Called after SUB RSP, N when destination is R_ESP.
+ * new_sp = cpu_regs[R_ESP] (already updated), old_sp = s->cc_srcT (saved before SUB).
+ */
+static void qdmsan_gen_stack_alloc(TCGv new_sp, TCGv old_sp) {
+  if (!use_qdmsan) return;
+  gen_helper_qdmsan_stack_alloc(new_sp, old_sp);
+}
+
+/*
+ * qdmsan_gen_call_fill — emit TCG call to fill the x86-64 red zone.
+ * Called at CALL instruction, before gen_push_v (return address push).
+ * caller_rsp is cpu_regs[R_ESP] at that point (before the push).
+ */
+static void qdmsan_gen_call_fill(TCGv caller_rsp) {
+  if (!use_qdmsan) return;
+  gen_helper_qdmsan_call_fill(caller_rsp);
+}
 
 static void afl_gen_compcov(target_ulong cur_loc, TCGv arg1, TCGv arg2,
                             MemOp ot, int is_imm) {

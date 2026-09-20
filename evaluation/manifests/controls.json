@@ -1,0 +1,262 @@
+[
+  {
+    "source": "p01_struct_pad_assign_tn.c",
+    "sha256": "6d4a3aa3b08b949d25b66bf417bdb91a8317c4bc0515a2984539d891d67864cd",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p01_struct_pad_assign_tp.c",
+    "sha256": "3efb510bb8669298b363403d3c1e46734efde2f0879ed5626f70cd4dde421e95",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p02_partial_memcpy_tn.c",
+    "sha256": "bf231d90015eb62ed24140c91154d78821c801727005017328c7d6d8b9526e94",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p02_partial_memcpy_tp.c",
+    "sha256": "861a069827aeb09185935cf25b6855440acc005e6020bd353519d0a394f228e2",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p03_realloc_grow_tn.c",
+    "sha256": "2de99358454b17db6781d7cf25ddf76d4979c61d86d1d92611b210e08af91612",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p03_realloc_grow_tp.c",
+    "sha256": "528ba5cc183bdb2fb7870c6173aa82fbf64e3cef2d068679a84a243feb74f5ce",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p04_loop_copy_tn.c",
+    "sha256": "622f6a8a6e591dab2426a1b989a9306e8581be3cc7d8dae36ed0a6a20d842884",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p04_loop_copy_tp.c",
+    "sha256": "5c89a4abed5b07e024e1bc49f27b6b30ea6a2053878740ecb8baf64c64e52740",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p05_memmove_inplace_tn.c",
+    "sha256": "8611fa9c15786505018feb28a55d29cb6ab7b93e5bcd7a36956b4cd207b98009",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p05_memmove_inplace_tp.c",
+    "sha256": "c9c234a2c1935aae4e5f9488db30fd624e0d25ff0742cf44b9250a36152c21f7",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p06_stack_to_heap_free_tn.c",
+    "sha256": "0cfb27cb3cf4954fdd4ebccf749f726e4daf4366f165737b2829c30c94219cc1",
+    "role": "good",
+    "group": "output",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p06_stack_to_heap_free_tp.c",
+    "sha256": "c035d9ffa1dab3f7bbfb6cc0bba2e6202a0e1f2aa0dc0d662bf5260fbdba8d26",
+    "role": "bad",
+    "group": "output",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p07_printf_uninit_tail_tn.c",
+    "sha256": "50aa41ee02da45f60c40a96ed9721724d25310f6d0abe849df4c2c1e1d747056",
+    "role": "good",
+    "group": "output",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p07_printf_uninit_tail_tp.c",
+    "sha256": "80a42364e441d010c9b081eb76c8af4cfd33ae698f32be5eabae61711464153d",
+    "role": "bad",
+    "group": "output",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p08_write_prefix_tn.c",
+    "sha256": "09785dff5cbc4d19d06421649eefbab525ad5cacff58895ce1701082849aea5f",
+    "role": "good",
+    "group": "output",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p08_write_prefix_tp.c",
+    "sha256": "65ef15befe0ea75e3789f6efca057f8650d774c7f5f0a8dcfb1b4c008819e80c",
+    "role": "bad",
+    "group": "output",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p09_mask_zero_tn.c",
+    "sha256": "90dad12e0eae8f0ff76abd762bc346690f8e17a8af119272425c1de086172da1",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p09_mask_zero_tp.c",
+    "sha256": "ee61373fbb3ecc6e9ed63a10a02711ee9469dc660a66b254364471a7d619f7ae",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p10_memcmp_prefix_tn.c",
+    "sha256": "58953700301cfaef9a9b3eea72b45d94aff9f62aaf8acb462d96eeabe9af0ad1",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p10_memcmp_prefix_tp.c",
+    "sha256": "8b2a041d6dd6cdf6d9f39a6f80149107c03dba916fd0dac14802bf7f2af7aa26",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p11_partial_word_tn.c",
+    "sha256": "20e6fcd660ed9b3132865d81b8a4060a24df63f61c794ccb1366bb9ddd8724ab",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p11_partial_word_tp.c",
+    "sha256": "b44cfe32d7bbc8714c817537debb425cc4ba125a602d208c279d5f3303101063",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p12_cmov_select_tn.c",
+    "sha256": "a7bd8da4cadf74950f2a62906822c6c1b93558e57d46c18474f2d48f61ae3ece",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p12_cmov_select_tp.c",
+    "sha256": "c55e938517cdf4e34f1234869316e8567e31ce3b4026cf9c467735bb0216563d",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p13_struct_return_reg_tn.c",
+    "sha256": "88018bfc0a56d6ac1719fa9b30ddb4d01bd87bc75a5b8c9862359db66f8a3ed1",
+    "role": "good",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  },
+  {
+    "source": "p13_struct_return_reg_tp.c",
+    "sha256": "989bb3fa8e9c0990944b236d2bfdefb51833d80c5b5f5a4b72f055ea1b50e383",
+    "role": "bad",
+    "group": "branch_addr",
+    "optimizations": [
+      "O0",
+      "O2"
+    ]
+  }
+]

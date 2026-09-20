@@ -113,6 +113,10 @@ extern unsigned char   persistent_save_gpr;
 extern unsigned char   persistent_memory;
 extern int             persisent_retaddr_offset;
 extern int             use_qasan;
+extern int             use_qdmsan;
+/* OOB/UAF heap planes (access helper + region registry).  Off unless
+ * AFL_QDMSAN_HEAP_PLANES is 1, on, true or yes. */
+extern int             qdmsan_heap_planes_enabled;
 extern __thread int    cur_block_is_good;
 extern struct api_regs saved_regs;
 

@@ -939,6 +939,101 @@ void perform_dry_run(afl_state_t *afl) {
 
     res = calibrate_case(afl, q, use_mem, 0, 1);
 
+    /* DMSAN: Run differential testing on initial seeds after calibration.
+       Skip for non-deterministic inputs (var_behavior detected by calibration).
+       This catches uninitialized memory bugs in seed corpus. */
+    if (unlikely(afl->dmsan_enabled) && !q->var_behavior &&
+        (res == FSRV_RUN_OK || res == FSRV_RUN_NOBITS)) {
+
+      /* Inline mode: prefer calibration reuse when calibrate_case has already
+         collected Run1/Run2 signatures. Fall back to the regular integrated
+         check if no reusable signatures were captured. */
+      dmsan_result_t dmsan_result =
+          afl->dmsan_inline_mode
+              ? (afl->dmsan_cal_have_sigs
+                     ? dmsan_check_from_calibration(afl, use_mem, q->len)
+                     : dmsan_integrated_check(afl, use_mem, q->len))
+              : dmsan_check(afl, use_mem, q->len);
+      /* In integrated mode the pre-exec clear in afl-fuzz-run.c covers Run1,
+         but after dmsan_integrated_check() the feedback maps still hold Run1
+         data.  Clear them now so the next calibrate/exec starts clean. */
+      if (afl->dmsan_inline_mode) { dmsan_clear_feedback_maps(afl); }
+
+      if (dmsan_result == DMSAN_TIMEOUT) {
+
+        ++afl->total_tmouts;
+
+      /* Only save findings for actual bugs and crashes. */
+      } else if (dmsan_result == DMSAN_BUG_FOUND ||
+                 dmsan_result == DMSAN_CRASH) {
+
+        /* Apply the same uniqueness limit used for saved crash inputs. */
+        u8 should_save = 1;
+
+        if (afl->saved_dmsan_findings >= KEEP_UNIQUE_DMSAN) {
+
+          should_save = 0;
+
+        } else if (likely(!afl->non_instrumented_mode)) {
+
+          /* Always use fsrv.trace_bits (main binary trace) for dedup,
+             matching the main-loop behavior at bitmap.c:858.
+             In integrated mode, dmsan_integrated_check() restores
+             fsrv.trace_bits to Run1.  In sidecar mode, dmsan_check()
+             doesn't touch fsrv.trace_bits (san_but_not_instrumented=1
+             skips memset, and the sidecar child has no coverage edges),
+             so it retains the calibration trace. dmsan_fsrv.trace_bits is not
+             used here because the sidecar child does not write coverage into
+             that buffer. */
+          u8 *finding_trace_bits = afl->fsrv.trace_bits;
+
+          simplify_trace(afl, finding_trace_bits);
+
+          if (!has_new_bits_in(afl, finding_trace_bits, afl->virgin_dmsan)) {
+            should_save = 0;
+          }
+
+        }
+
+        if (should_save) {
+
+          dmsan_finding_t finding = {0};
+          afl->stage_name = "dry_run";
+          afl->stage_short = "dry_run";
+          if (!dmsan_save_finding(afl, use_mem, q->len, dmsan_result,
+                                  &finding)) {
+            goto dmsan_seed_done;
+          }
+
+          WARNF("DMSAN: Seed '%s' triggers uninitialized memory bug!", fn);
+
+          /* Save to crashes/ directory like save_if_interesting() does */
+          u8  crash_fn[PATH_MAX];
+          s32 crash_fd;
+
+          if (!afl->saved_crashes) { write_crash_readme(afl); }
+
+          snprintf(crash_fn, PATH_MAX, "%s/crashes/id:%06llu,sig:00,%s,+san",
+                   afl->out_dir, afl->saved_crashes, fn);
+
+          crash_fd = open(crash_fn, O_WRONLY | O_CREAT | O_EXCL, afl->perm);
+          if (crash_fd >= 0) {
+
+            ck_write(crash_fd, use_mem, q->len, crash_fn);
+            close(crash_fd);
+            ++afl->saved_crashes;
+            ++afl->total_crashes;
+
+          }
+
+        }
+
+      dmsan_seed_done:;
+
+      }
+
+    }
+
     /* For AFLFast schedules we update the queue entry */
     if (unlikely(afl->schedule >= FAST && afl->schedule <= RARE) &&
         likely(q->exec_cksum)) {

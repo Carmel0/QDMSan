@@ -34,6 +34,8 @@
 // new_bits value 1, 2 and 0x80 are already used!
 #define SAN_CRASH_ONLY (1 << 4)
 #define NON_COV_INCREASE_BUG (1 << 5)
+#define SAN_MSAN_ONLY (1 << 6)
+#define SAN_DMSAN_ONLY (1 << 7)
 
 enum SanitizerAbstraction {
 

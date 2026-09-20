@@ -28,6 +28,7 @@ DEF_HELPER_FLAGS_1(lookup_tb_ptr, TCG_CALL_NO_WG_SE, cptr, env)
 
 DEF_HELPER_FLAGS_1(exit_atomic, TCG_CALL_NO_WG, noreturn, env)
 
+
 #ifndef IN_HELPER_PROTO
 /*
  * Pass calls to memset directly to libc, without a thunk in qemu.
@@ -345,6 +346,45 @@ DEF_HELPER_FLAGS_3(afl_cmplog_16, TCG_CALL_NO_RWG, void, tl, tl, tl)
 DEF_HELPER_FLAGS_3(afl_cmplog_32, TCG_CALL_NO_RWG, void, tl, tl, tl)
 DEF_HELPER_FLAGS_3(afl_cmplog_64, TCG_CALL_NO_RWG, void, tl, tl, tl)
 DEF_HELPER_FLAGS_1(afl_cmplog_rtn, TCG_CALL_NO_RWG, void, env)
+
+/* QDMSAN: CMP/SUB checkpoints — record both operands */
+DEF_HELPER_FLAGS_3(qdmsan_checkpoint_8,  TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_checkpoint_16, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_checkpoint_32, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_checkpoint_64, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_checkpoint_imm_8,  TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_checkpoint_imm_16, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_checkpoint_imm_32, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_checkpoint_imm_64, TCG_CALL_NO_RWG, void, tl, tl, tl)
+
+/* QDMSAN: AND checkpoints — absorbing element is 0, skip if either operand == 0 */
+DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_8,  TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_16, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_32, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_64, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_imm_8,  TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_imm_16, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_imm_32, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_and_checkpoint_imm_64, TCG_CALL_NO_RWG, void, tl, tl, tl)
+
+/* QDMSAN: SSE/AVX floating-point compare checkpoint (ucomiss/ucomisd/comiss/comisd).
+ * Records CC_SRC (EFLAGS) after the comparison: one of CC_C=0x1 (less),
+ * CC_Z=0x40 (equal), 0 (greater), CC_Z|CC_P|CC_C=0x45 (unordered/NaN). */
+DEF_HELPER_FLAGS_2(qdmsan_ucomis_checkpoint, TCG_CALL_NO_RWG, void, tl, env)
+DEF_HELPER_FLAGS_3(qdmsan_value_checkpoint, TCG_CALL_NO_RWG, void, tl, tl, tl)
+DEF_HELPER_FLAGS_3(qdmsan_ptr_checkpoint, TCG_CALL_NO_RWG, void, tl, tl, tl)
+
+/* QDMSAN sparse-region access checkpoint.  This helper reads registered guest
+ * bytes and updates shared-memory digests, so it must retain the default
+ * read/write-global call flags. */
+DEF_HELPER_4(qdmsan_access, void, env, tl, tl, tl)
+
+/* QDMSAN: stack frame poisoning — fill [new_sp, old_sp) with DMSAN poison */
+DEF_HELPER_FLAGS_2(qdmsan_stack_alloc, TCG_CALL_NO_RWG, void, tl, tl)
+/* QDMSAN: CALL-time red-zone fill (x86-64 only) */
+DEF_HELPER_FLAGS_1(qdmsan_call_fill,   TCG_CALL_NO_RWG, void, tl)
+DEF_HELPER_FLAGS_1(qdmsan_shadow_stack_push, TCG_CALL_NO_RWG, void, tl)
+DEF_HELPER_FLAGS_1(qdmsan_shadow_stack_pop, TCG_CALL_NO_RWG, void, tl)
 
 DEF_HELPER_FLAGS_5(qasan_fake_instr, TCG_CALL_NO_RWG, tl, env, tl, tl, tl, tl)
 DEF_HELPER_FLAGS_2(qasan_load1, TCG_CALL_NO_RWG, void, env, tl)

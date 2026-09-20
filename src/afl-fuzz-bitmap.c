@@ -218,16 +218,27 @@ void init_count_class16(void) {
 
 inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 
+  return has_new_bits_in(afl, afl->fsrv.trace_bits, virgin_map);
+
+}
+
+/* Like has_new_bits() but reads from an explicit current buffer instead of
+   afl->fsrv.trace_bits. This is needed for sanitizer-specific finding
+   deduplication, where the simplified trace may live in dmsan_fsrv buffers or
+   in a temporary copy rather than the main coverage map. */
+
+inline u8 has_new_bits_in(afl_state_t *afl, u8 *current_buf, u8 *virgin_map) {
+
 #ifdef WORD_SIZE_64
 
-  u64 *current = (u64 *)afl->fsrv.trace_bits;
+  u64 *current = (u64 *)current_buf;
   u64 *virgin = (u64 *)virgin_map;
 
   u32 i = ((afl->fsrv.real_map_size + 7) >> 3);
 
 #else
 
-  u32 *current = (u32 *)afl->fsrv.trace_bits;
+  u32 *current = (u32 *)current_buf;
   u32 *virgin = (u32 *)virgin_map;
 
   u32 i = ((afl->fsrv.real_map_size + 3) >> 2);
@@ -311,6 +322,8 @@ u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
   u8 is_timeout = 0;
   u8 san_crash_only = (afl->san_case_status & SAN_CRASH_ONLY);
   u8 non_cov_incr = (afl->san_case_status & NON_COV_INCREASE_BUG);
+  u8 msan_only = (afl->san_case_status & SAN_MSAN_ONLY);
+  u8 dmsan_only = (afl->san_case_status & SAN_DMSAN_ONLY);
 
   if (new_bits & 0xf0) {
 
@@ -411,6 +424,8 @@ u8 *describe_op(afl_state_t *afl, u8 new_bits, size_t max_description_len) {
   if (new_bits == 2) { strcat(ret, ",+cov"); }
 
   if (san_crash_only) { strcat(ret, ",+san"); }
+  if (msan_only) { strcat(ret, ",msan_only"); }
+  if (dmsan_only) { strcat(ret, ",dmsan_only"); }
 
   if (non_cov_incr) { strcat(ret, ",+noncov"); }
 
@@ -524,6 +539,75 @@ static inline void calculate_new_bits_if_necessary(afl_state_t *afl,
 
 }
 
+static inline void set_san_origin_flags(afl_state_t *afl, u8 msan_hit,
+                                        u8 dmsan_hit) {
+
+  afl->san_case_status &= ~(SAN_MSAN_ONLY | SAN_DMSAN_ONLY);
+  if (msan_hit && !dmsan_hit) {
+    afl->san_case_status |= SAN_MSAN_ONLY;
+  } else if (dmsan_hit && !msan_hit) {
+    afl->san_case_status |= SAN_DMSAN_ONLY;
+  }
+
+}
+
+static inline u8 run_msan_sidecars(afl_state_t *afl, void **mem, u32 len,
+                                   u8 *san_fault) {
+
+  u8 msan_hit = 0;
+
+  if (!afl->san_binary_length) { return 0; }
+
+  for (u8 san_idx = 0; san_idx < afl->san_binary_length; ++san_idx) {
+
+    len = write_to_testcase(afl, mem, len, 0);
+    *san_fault = fuzz_run_target(afl, &afl->san_fsrvs[san_idx],
+                                 afl->san_fsrvs[san_idx].exec_tmout);
+
+    if (unlikely(*san_fault && afl->crash_mode == FSRV_RUN_OK)) {
+      afl->san_case_status |= SAN_CRASH_ONLY;
+    }
+
+    if (*san_fault == FSRV_RUN_CRASH) {
+
+      msan_hit = 1;
+      break;
+
+    }
+
+    *san_fault = FSRV_RUN_OK;
+
+  }
+
+  return msan_hit;
+
+}
+
+static inline u8 save_categorized_san_case_if_unique(afl_state_t *afl, void *mem,
+                                                      u32 len,
+                                                      const char *subdir,
+                                                      u8 *virgin_map,
+                                                      u64 limit,
+                                                      u64 *next_id,
+                                                      u64 *saved_count) {
+
+  if (!virgin_map || !saved_count || !next_id) { return 0; }
+  if (*saved_count >= limit) { return 0; }
+
+  if (likely(!afl->non_instrumented_mode)) {
+
+    memcpy(afl->map_tmp_buf, afl->fsrv.trace_bits, afl->fsrv.map_size);
+    simplify_trace(afl, afl->map_tmp_buf);
+
+    if (!has_new_bits_in(afl, afl->map_tmp_buf, virgin_map)) { return 0; }
+
+  }
+
+  return dmsan_save_categorized_finding(afl, mem, len, subdir, next_id,
+                                        saved_count);
+
+}
+
 /* Check if the result of an execve() during routine fuzzing is interesting,
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
@@ -553,7 +637,12 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
   u8  fn[PATH_MAX];
   u8 *queue_fn = "";
   u8  keeping = 0, res, is_timeout = 0;
-  u8  san_fault = 0, san_idx = 0, feed_san = 0;
+  u8  san_fault = 0, feed_san = 0, feed_dmsan = 0;
+  u8  msan_hit = 0, dmsan_hit = 0;
+  u8  msan_executed = 0;
+  /* Deferred inline-DMSAN handling after save_to_queue consumes these values. */
+  dmsan_result_t dmsan_result = DMSAN_CLEAN;
+  u8  dmsan_executed = 0, dmsan_deferred = 0;
   s32 fd;
   u32 cksum_simplified = 0, cksum_unique = 0;
 
@@ -620,7 +709,7 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
 
       cksum_unique =
           hash32(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
-      if (unlikely(!bitmap_read(afl->n_fuzz_dup, cksum) &&
+      if (unlikely(!bitmap_read(afl->n_fuzz_dup, cksum_unique) &&
                    fault == afl->crash_mode)) {
 
         feed_san = 1;
@@ -630,38 +719,34 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
 
     }
 
-    if (feed_san) {
+    /* DMSAN:
+       - integrated mode: main execution is Run1, so every input completes
+         differential checking here
+       - sidecar mode: new simplified traces trigger direct checking
+       - optional feedback overlay can later promote old-path probes */
+    if (unlikely(afl->dmsan_enabled)) {
 
-      /* The input seems interested to other sanitizers, feed it into extra
-       * binaries. */
+      if (afl->dmsan_inline_mode) {
 
-      for (san_idx = 0; san_idx < afl->san_binary_length; san_idx++) {
+        feed_dmsan = 1;
 
-        len = write_to_testcase(afl, &mem, len, 0);
-        san_fault = fuzz_run_target(afl, &afl->san_fsrvs[san_idx],
-                                    afl->san_fsrvs[san_idx].exec_tmout);
+      } else {
 
-        // DEBUGF("ASAN Result: %hhd\n", asan_fault);
+        if (!cksum_simplified) {
 
-        if (unlikely(san_fault && fault == afl->crash_mode)) {
-
-          /* sanitizers discovers distinct bugs! */
-          afl->san_case_status |= SAN_CRASH_ONLY;
+          u8 *dmsan_trace =
+              dmsan_ensure_trace_scratch(afl, afl->fsrv.map_size);
+          memcpy(dmsan_trace, afl->fsrv.trace_bits, afl->fsrv.map_size);
+          simplify_trace(afl, dmsan_trace);
+          cksum_simplified =
+              hash32(dmsan_trace, afl->fsrv.map_size, HASH_CONST);
 
         }
 
-        if (san_fault == FSRV_RUN_CRASH) {
+        if (unlikely(!bitmap_read(afl->dmsan_n_fuzz, cksum_simplified))) {
 
-          /* Treat this execution as fault detected by ASAN */
-          // fault = san_fault;
-
-          /* That's pretty enough, break to avoid more overhead. */
-          break;
-
-        } else {
-
-          // or keep san_fault as ok
-          san_fault = FSRV_RUN_OK;
+          feed_dmsan = 1;
+          bitmap_set(afl->dmsan_n_fuzz, cksum_simplified);
 
         }
 
@@ -669,7 +754,208 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
 
     }
 
+    if (feed_san) {
+
+      /* The input seems interested to other sanitizers, feed it into extra
+       * binaries. */
+      msan_executed = 1;
+      msan_hit = run_msan_sidecars(afl, &mem, len, &san_fault);
+
+    }
+
+    /* DMSAN:
+       - inline mode: the main execution already produced Run1. Coverage-new
+         inputs are checked after calibrate_case so calibration can provide the
+         Run2 signature. Non-new inputs are checked immediately.
+       - sidecar mode: simplified-trace dedup, with an optional old-path probe. */
+    /* dmsan_result / dmsan_executed / dmsan_deferred are function-scoped
+       above so the post-calibrate deferred block can consume them. */
+
+    if (unlikely(afl->dmsan_inline_mode)) {
+
+      /* Predict will_queue early only when no -w cross-check is active and
+         calibration reuse is enabled. The MSan cross-check path still needs to
+         observe whether DMSAN has already run for this input. */
+      u8 will_queue_via_cov = 0;
+      if (!afl->san_binary_length && afl->dmsan_cal_reuse_enabled) {
+        calculate_new_bits_if_necessary(afl, &new_bits, &bits_counted,
+                                        &classified);
+        will_queue_via_cov = (new_bits > 0);
+      }
+
+      if (will_queue_via_cov) {
+
+        dmsan_deferred = 1;
+        /* Don't clear feedback maps here - calibrate_case cycle 0 will
+           overwrite the SHM via the per-exec hook. */
+
+      } else {
+
+        dmsan_result = dmsan_integrated_check(afl, mem, len);
+        dmsan_executed = 1;
+        /* Clear feedback/siteclass SHM so the next Run1 starts clean.
+           site_map uses OR and would converge to all-1s without clearing. */
+        dmsan_clear_feedback_maps(afl);
+
+      }
+
+    } else if (feed_dmsan) {
+
+      dmsan_result = dmsan_check(afl, mem, len);
+      dmsan_executed = 1;
+
+    } else if (unlikely(afl->dmsan_enabled) && afl->dmsan_aux_feedback) {
+
+      /* Old-path probes are only useful with aux feedback, because aux novelty
+         is the escalation criterion. */
+      dmsan_result =
+          dmsan_maybe_probe_feedback(afl, mem, len, cksum_simplified,
+                                     &dmsan_executed);
+
+    }
+
+    if (dmsan_executed) {
+
+      if (dmsan_result == DMSAN_TIMEOUT && !msan_hit) {
+        fault = FSRV_RUN_TMOUT;
+        goto may_save_fault;
+      }
+
+      /* Aux site-map novelty on a clean run promotes the input into the queue. */
+      if (afl->dmsan_aux_feedback && afl->dmsan_aux_compiled &&
+          dmsan_result == DMSAN_CLEAN && afl->dmsan_last_aux_novelty) {
+
+        calculate_new_bits_if_necessary(afl, &new_bits, &bits_counted,
+                                        &classified);
+        if (!new_bits) { goto save_to_queue; }
+
+      }
+
+      /* Only save findings for actual bugs and crashes. */
+      if (dmsan_result == DMSAN_BUG_FOUND || dmsan_result == DMSAN_CRASH) {
+
+        /* Always mark the input for the standard crash-saving path. DMSAN keeps
+           an additional dmsan_findings/ dedup layer below, but crash accounting
+           should remain aligned with other sanitizer sidecars. */
+        dmsan_hit = 1;
+        afl->san_case_status |= SAN_CRASH_ONLY;
+        san_fault = FSRV_RUN_CRASH;
+
+        /* Dedup for dmsan_findings/ directory (additional DMSAN-specific dedup
+           on top of the standard crash dedup in keep_as_crash). */
+        if (afl->saved_dmsan_findings >= KEEP_UNIQUE_DMSAN) { goto dmsan_done; }
+
+        if (likely(!afl->non_instrumented_mode)) {
+
+          /* Always refresh from fsrv.trace_bits so dedup uses current-
+             execution data.  In integrated mode dmsan_integrated_check()
+             restores fsrv.trace_bits to Run1 before returning; in sidecar
+             mode it is the main-binary trace.  Using fsrv.trace_bits
+             unconditionally also fixes a stale-buffer bug: when -w and -j
+             are both active, MSan's SIMPLIFY_TRACE path can set
+             cksum_simplified before DMSAN refreshes its dedup trace. */
+          u8 *dmsan_trace =
+              dmsan_ensure_trace_scratch(afl, afl->fsrv.map_size);
+          memcpy(dmsan_trace, afl->fsrv.trace_bits, afl->fsrv.map_size);
+          simplify_trace(afl, dmsan_trace);
+
+          if (!has_new_bits_in(afl, dmsan_trace, afl->virgin_dmsan)) {
+            goto dmsan_done;
+          }
+
+        }
+
+        dmsan_finding_t finding = {0};
+        set_san_origin_flags(afl, msan_hit, dmsan_hit);
+        if (!dmsan_save_finding(afl, mem, len, dmsan_result, &finding)) {
+          goto dmsan_done;
+        }
+
+      }
+
+    dmsan_done:;
+
+    }
+
+    if (unlikely(afl->dmsan_enabled && afl->san_binary_length)) {
+      if (msan_hit && !dmsan_hit && !dmsan_executed) {
+
+        /* Cross-classification supplemental run: MSan triggered but DMSAN has
+           not executed yet.  Use dmsan_crosscheck() instead of dmsan_check()
+           so these runs are tallied separately and do not inflate
+           dmsan_direct_checks (which should only count sidecar-triggered
+           differential checks). */
+        dmsan_result = dmsan_crosscheck(afl, mem, len);
+        dmsan_executed = 1;
+
+        if (dmsan_result == DMSAN_BUG_FOUND || dmsan_result == DMSAN_CRASH) {
+
+          dmsan_hit = 1;
+
+          if (afl->saved_dmsan_findings < KEEP_UNIQUE_DMSAN) {
+
+            if (likely(!afl->non_instrumented_mode)) {
+
+              /* Cross-trigger is sidecar-only (integrated mode always sets
+                 dmsan_executed=1, so !dmsan_executed is impossible there).
+                 Refresh from fsrv.trace_bits for the same reason as the
+                 primary path: -w MSan can set cksum_simplified before DMSAN
+                 refreshes its dedup trace. */
+              u8 *dmsan_trace =
+                  dmsan_ensure_trace_scratch(afl, afl->fsrv.map_size);
+              memcpy(dmsan_trace, afl->fsrv.trace_bits, afl->fsrv.map_size);
+              simplify_trace(afl, dmsan_trace);
+
+              if (has_new_bits_in(afl, dmsan_trace, afl->virgin_dmsan)) {
+
+                dmsan_finding_t finding = {0};
+                dmsan_save_finding(afl, mem, len, dmsan_result, &finding);
+
+              }
+
+            } else {
+
+              dmsan_finding_t finding = {0};
+              dmsan_save_finding(afl, mem, len, dmsan_result, &finding);
+
+            }
+          }
+
+          afl->san_case_status |= SAN_CRASH_ONLY;
+          san_fault = FSRV_RUN_CRASH;
+
+        }
+
+      } else if (dmsan_hit && !msan_hit && !msan_executed) {
+
+        msan_executed = 1;
+        msan_hit = run_msan_sidecars(afl, &mem, len, &san_fault);
+
+      }
+
+      set_san_origin_flags(afl, msan_hit, dmsan_hit);
+
+      if (msan_hit && !dmsan_hit) {
+
+        save_categorized_san_case_if_unique(
+            afl, mem, len, "msan_only", afl->virgin_msan_only,
+            KEEP_UNIQUE_MSAN_ONLY, &afl->msan_only_next_id,
+            &afl->saved_msan_only);
+
+      } else if (dmsan_hit && !msan_hit) {
+
+        save_categorized_san_case_if_unique(
+            afl, mem, len, "dmsan_only", afl->virgin_dmsan_only,
+            KEEP_UNIQUE_DMSAN_ONLY, &afl->dmsan_only_next_id,
+            &afl->saved_dmsan_only);
+
+      }
+
+    }
+
   }
+
+  set_san_origin_flags(afl, msan_hit, dmsan_hit);
 
   /* If there is no crash, everything is fine. */
   if (likely(fault == afl->crash_mode)) {
@@ -742,6 +1028,9 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
     }
 
     add_to_queue(afl, queue_fn, len, 0);
+    afl->queue_top->has_new_dmsan_feedback =
+        afl->dmsan_aux_feedback && afl->dmsan_aux_compiled &&
+        afl->dmsan_last_aux_novelty != 0;
 
     if (unlikely(afl->fuzz_mode) &&
         likely(afl->switch_fuzz_mode && !afl->non_instrumented_mode)) {
@@ -809,6 +1098,67 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
     if (unlikely(res == FSRV_RUN_ERROR)) {
 
       FATAL("Unable to execute target application");
+
+    }
+
+    /* Deferred inline DMSAN check. Inputs queued via new coverage can reuse the
+       Run1/Run2 signatures captured during calibration and only need a fresh
+       Run3 when those signatures diverge. */
+    if (unlikely(dmsan_deferred)) {
+
+      if (afl->dmsan_cal_have_sigs) {
+
+        dmsan_result = dmsan_check_from_calibration(afl, mem, len);
+
+      } else {
+
+        dmsan_result = dmsan_integrated_check(afl, mem, len);
+
+      }
+      dmsan_executed = 1;
+      dmsan_clear_feedback_maps(afl);
+
+      if (dmsan_result == DMSAN_TIMEOUT && !msan_hit) {
+        keeping = 1;
+        fault = FSRV_RUN_TMOUT;
+        goto may_save_fault;
+      }
+
+      /* Stamp aux-feedback queue weight retroactively (the original
+         pre-calibrate stamp at add_to_queue ran with last_aux_novelty=0). */
+      if (afl->dmsan_aux_feedback && afl->dmsan_aux_compiled &&
+          afl->dmsan_last_aux_novelty) {
+        afl->queue_top->has_new_dmsan_feedback = 1;
+      }
+
+      /* BUG / CRASH save (mirror of the original feed_dmsan post-check
+         block, applied retroactively to the just-added queue entry). */
+      if (dmsan_result == DMSAN_BUG_FOUND || dmsan_result == DMSAN_CRASH) {
+
+        dmsan_hit = 1;
+        afl->san_case_status |= SAN_CRASH_ONLY;
+        san_fault = FSRV_RUN_CRASH;
+        fault = FSRV_RUN_CRASH;
+
+        if (afl->saved_dmsan_findings < KEEP_UNIQUE_DMSAN &&
+            likely(!afl->non_instrumented_mode)) {
+
+          u8 *dmsan_trace =
+              dmsan_ensure_trace_scratch(afl, afl->fsrv.map_size);
+          memcpy(dmsan_trace, afl->fsrv.trace_bits, afl->fsrv.map_size);
+          simplify_trace(afl, dmsan_trace);
+
+          if (has_new_bits_in(afl, dmsan_trace, afl->virgin_dmsan)) {
+
+            dmsan_finding_t finding = {0};
+            set_san_origin_flags(afl, msan_hit, dmsan_hit);
+            dmsan_save_finding(afl, mem, len, dmsan_result, &finding);
+
+          }
+
+        }
+
+      }
 
     }
 

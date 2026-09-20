@@ -37,6 +37,7 @@
 
 #include "cmplog.h"
 #include "asanfuzz.h"
+#include "dmsanfuzz.h"
 
 #ifdef PROFILING
 u64 time_spent_working = 0;
@@ -62,6 +63,52 @@ fsrv_run_result_t __attribute__((hot)) fuzz_run_target(afl_state_t      *afl,
   }
 
 #endif
+
+  /* Integrated DMSAN mode: clear DMSAN SHM and reset poison before each main
+     exec so the main binary itself acts as Run1. Internal Run2/Run3 reuse the
+     same forkserver with dmsan_checking=1 and must not be cleared here. */
+  if (unlikely(afl->dmsan_inline_mode) && !afl->dmsan_checking &&
+      fsrv == &afl->fsrv && afl->dmsan_shm_fast) {
+
+    if (!afl->dmsan_trace_backup ||
+        afl->dmsan_trace_backup_size < fsrv->map_size + 8) {
+
+      if (afl->dmsan_trace_backup) {
+        ck_free(afl->dmsan_trace_backup);
+      }
+      afl->dmsan_trace_backup = ck_alloc(fsrv->map_size + 8);
+      afl->dmsan_trace_backup_size = fsrv->map_size + 8;
+
+    }
+
+    if (afl->dmsan_fsrv.trace_bits && afl->dmsan_fsrv.map_size < fsrv->map_size) {
+
+      ck_free(afl->dmsan_fsrv.trace_bits);
+      afl->dmsan_fsrv.trace_bits = ck_alloc(fsrv->map_size + 8);
+      afl->dmsan_fsrv.map_size = fsrv->map_size;
+
+    }
+
+    struct dmsan_fast_map *dmap =
+        (struct dmsan_fast_map *)(void *)afl->dmsan_shm_fast;
+    memset(dmap, 0, sizeof(*dmap));
+    dmap->fixed_time_sec = afl->dmsan_fixed_time_sec;
+    dmap->fixed_time_usec = afl->dmsan_fixed_time_usec;
+    dmap->fixed_rand_base = afl->dmsan_fixed_rand_base;
+    dmap->fixed_tsc_base = afl->dmsan_fixed_tsc_base;
+    dmap->fixed_rdrand_base = afl->dmsan_fixed_rdrand_base;
+
+    /* Inline DMSAN must zero the aux site_map between inputs; otherwise the
+       OR-accumulator carries Run1 state across to the next input. */
+    if (afl->dmsan_shm_feedback && afl->dmsan_aux_compiled) {
+      struct dmsan_feedback_shm *feedback =
+          (struct dmsan_feedback_shm *)(void *)afl->dmsan_shm_feedback;
+      memset(feedback->site_map, 0, sizeof(feedback->site_map));
+    }
+
+    if (afl->dmsan_shm_poison) { *afl->dmsan_shm_poison = DMSAN_POISON_RUN1; }
+
+  }
 
   fsrv_run_result_t res = afl_fsrv_run_target(fsrv, timeout, &afl->stop_soon);
 
@@ -615,6 +662,19 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
   start_us = get_cur_time_us();
 
+  /* Inline DMSAN reuses the first two calibration cycles as Run1 and Run2.
+     The per-exec hook normally resets DMSAN SHM and forces poison=0x11; cycle
+     1 raises dmsan_checking and sets poison=0x22 before restoring the normal
+     state for later cycles. */
+  u8 dmsan_cal_active = afl->dmsan_enabled && afl->dmsan_inline_mode &&
+                        afl->dmsan_cal_reuse_enabled &&
+                        afl->dmsan_shm_fast && afl->dmsan_shm_poison &&
+                        afl->stage_max >= 2 && !afl->dmsan_checking;
+  const char *paper_compat = getenv("AFL_QDMSAN_PAPER_COMPAT");
+  u8 qdmsan_isolate_run2 = dmsan_cal_active && afl->qdmsan_enabled &&
+                           !(paper_compat && !strcmp(paper_compat, "1"));
+  afl->dmsan_cal_have_sigs = 0;
+
   for (afl->stage_cur = 0; afl->stage_cur < afl->stage_max; ++afl->stage_cur) {
 
     if (unlikely(afl->debug)) {
@@ -625,9 +685,64 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 
     u64 cksum;
 
+    /* Cycle 1: drive Run2 by ourselves so the per-exec hook leaves our
+       poison alone. We also clear the aux site_map (if compiled in) so the
+       Run2 snapshot starts from zero - the OR-accumulator would otherwise
+       carry Run1 bits into Run2. */
+    if (dmsan_cal_active && afl->stage_cur == 1) {
+      afl->dmsan_checking = 1;
+      *afl->dmsan_shm_poison = DMSAN_POISON_RUN2;
+      struct dmsan_fast_map *dmap =
+          (struct dmsan_fast_map *)afl->dmsan_shm_fast;
+      u64 ft_sec = dmap->fixed_time_sec;
+      u64 ft_usec = dmap->fixed_time_usec;
+      u64 fr = dmap->fixed_rand_base;
+      u64 ftsc = dmap->fixed_tsc_base;
+      u64 fdr = dmap->fixed_rdrand_base;
+      memset(dmap, 0, sizeof(*dmap));
+      dmap->fixed_time_sec = ft_sec;
+      dmap->fixed_time_usec = ft_usec;
+      dmap->fixed_rand_base = fr;
+      dmap->fixed_tsc_base = ftsc;
+      dmap->fixed_rdrand_base = fdr;
+      if (afl->dmsan_aux_compiled && afl->dmsan_shm_feedback) {
+        struct dmsan_feedback_shm *fb =
+            (struct dmsan_feedback_shm *)afl->dmsan_shm_feedback;
+        memset(fb->site_map, 0, sizeof(fb->site_map));
+      }
+    }
+
     (void)write_to_testcase(afl, (void **)&use_mem, q->len, 1);
 
     fault = fuzz_run_target(afl, &afl->fsrv, use_tmout);
+
+    /* Snapshot Run1 / Run2 signatures + (when aux is compiled in) site_map
+       right after the cycle that produced them. */
+    if (dmsan_cal_active && fault == afl->crash_mode &&
+        afl->stage_cur <= 1 && afl->dmsan_shm_fast) {
+      struct dmsan_fast_map *sig_target =
+          (afl->stage_cur == 0) ? afl->dmsan_cal_sig1 : afl->dmsan_cal_sig2;
+      if (sig_target) {
+        memcpy(sig_target, afl->dmsan_shm_fast,
+               sizeof(struct dmsan_fast_map));
+      }
+      if (afl->dmsan_aux_compiled && afl->dmsan_shm_feedback) {
+        u16 *aux_target = (afl->stage_cur == 0) ? afl->dmsan_cal_aux1
+                                                : afl->dmsan_cal_aux2;
+        if (aux_target) {
+          struct dmsan_feedback_shm *fb =
+              (struct dmsan_feedback_shm *)afl->dmsan_shm_feedback;
+          memcpy(aux_target, fb->site_map, sizeof(fb->site_map));
+        }
+      }
+      if (afl->stage_cur == 1) {
+        *afl->dmsan_shm_poison = DMSAN_POISON_RUN1;
+        afl->dmsan_checking = 0;
+        if (afl->dmsan_cal_sig1 && afl->dmsan_cal_sig2) {
+          afl->dmsan_cal_have_sigs = 1;
+        }
+      }
+    }
 
     // update the time spend in calibration after each execution, as those may
     // be slow
@@ -636,7 +751,20 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
     /* afl->stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
 
-    if (afl->stop_soon || fault != afl->crash_mode) { goto abort_calibration; }
+    if (afl->stop_soon || fault != afl->crash_mode) {
+
+      /* Make sure we leave dmsan_checking / poison in a sane state if the
+         calibration aborts mid-Run2 cycle. */
+      if (dmsan_cal_active && afl->dmsan_checking) {
+        afl->dmsan_checking = 0;
+        if (afl->dmsan_shm_poison) {
+          *afl->dmsan_shm_poison = DMSAN_POISON_RUN1;
+        }
+        afl->dmsan_cal_have_sigs = 0;
+      }
+      goto abort_calibration;
+
+    }
 
     if (!afl->non_instrumented_mode &&
         !count_bytes(afl, afl->fsrv.trace_bits)) {
@@ -649,6 +777,13 @@ u8 calibrate_case(afl_state_t *afl, struct queue_entry *q, u8 *use_mem,
 #ifdef INTROSPECTION
     if (unlikely(!q->bitsmap_size)) { q->bitsmap_size = afl->bitsmap_size; }
 #endif
+
+    /* R2 deliberately changes the fill. Keep its signature for the inline
+       check, but do not let that controlled change consume virgin coverage
+       or masquerade as nondeterminism. Later R1 cycles still test stability.
+       Keep its execution/time in calibration accounting: it was really run.
+       Compiler DMSan and explicit paper compatibility retain their behavior. */
+    if (qdmsan_isolate_run2 && afl->stage_cur == 1) { continue; }
 
     classify_counts(&afl->fsrv);
     cksum = hash64(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
@@ -771,7 +906,12 @@ abort_calibration:
 
     afl->var_byte_count = count_bytes(afl, afl->var_bytes);
 
-    if (!q->var_behavior) { ++afl->queued_variable; }
+    if (!q->var_behavior) {
+
+      q->var_behavior = 1;
+      ++afl->queued_variable;
+
+    }
 
   }
 

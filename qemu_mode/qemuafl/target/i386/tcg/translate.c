@@ -250,6 +250,9 @@ typedef struct DisasContext {
     TCGv A0;
     TCGv T0;
     TCGv T1;
+    bool qdmsan_a0_static_clean;
+    bool qdmsan_cc_recorded_cmp;
+    bool qdmsan_t1_static_const;
 
     /* TCG local register indexes (only used inside old micro ops) */
     TCGv tmp0;
@@ -352,6 +355,8 @@ static const uint8_t cc_op_live[CC_OP_NB] = {
 static void set_cc_op(DisasContext *s, CCOp op)
 {
     int dead;
+
+    s->qdmsan_cc_recorded_cmp = false;
 
     if (s->cc_op == op) {
         return;
@@ -541,13 +546,60 @@ static inline void gen_op_add_reg_T0(DisasContext *s, MemOp size, int reg)
     gen_op_mov_reg_v(s, size, reg, s->tmp0);
 }
 
+static inline void qdmsan_mark_a0_static_clean(DisasContext *s)
+{
+    s->qdmsan_a0_static_clean = true;
+}
+
+static inline void qdmsan_clear_a0_static_clean(DisasContext *s)
+{
+    s->qdmsan_a0_static_clean = false;
+}
+
+static inline bool qdmsan_peek_a0_static_clean(DisasContext *s)
+{
+    return qdmsan_static_clean_pointer_prune_enabled &&
+           s->qdmsan_a0_static_clean;
+}
+
+static inline void qdmsan_mark_cc_recorded_cmp(DisasContext *s)
+{
+    s->qdmsan_cc_recorded_cmp = qdmsan_check_mode == QDMSAN_CHECK_RAW;
+}
+
+static inline bool qdmsan_prune_cmp_derived_branch(DisasContext *s)
+{
+    return qdmsan_cmp_branch_prune_enabled && s->qdmsan_cc_recorded_cmp;
+}
+
+static inline bool qdmsan_consume_a0_static_clean(DisasContext *s, TCGv a0)
+{
+    bool clean = a0 == s->A0 && qdmsan_peek_a0_static_clean(s);
+    s->qdmsan_a0_static_clean = false;
+    return clean;
+}
+
+static inline void qdmsan_gen_a0_ptr_checkpoint(DisasContext *s,
+                                                target_ulong kind)
+{
+    if (!qdmsan_consume_a0_static_clean(s, s->A0)) {
+        qdmsan_gen_ptr_checkpoint(s->pc_start, s->A0, kind);
+    }
+}
+
 static inline void gen_op_ld_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 {
+    if (!qdmsan_consume_a0_static_clean(s, a0)) {
+        qdmsan_gen_ptr_checkpoint(s->pc_start, a0, QDMSAN_EVENT_LOAD_PTR);
+    }
     tcg_gen_qemu_ld_tl(t0, a0, s->mem_index, idx | MO_LE);
 }
 
 static inline void gen_op_st_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 {
+    if (!qdmsan_consume_a0_static_clean(s, a0)) {
+        qdmsan_gen_ptr_checkpoint(s->pc_start, a0, QDMSAN_EVENT_STORE_PTR);
+    }
     tcg_gen_qemu_st_tl(t0, a0, s->mem_index, idx | MO_LE);
 }
 
@@ -572,6 +624,8 @@ static inline void gen_jmp_im(DisasContext *s, target_ulong pc)
 static void gen_lea_v_seg(DisasContext *s, MemOp aflag, TCGv a0,
                           int def_seg, int ovr_seg)
 {
+    qdmsan_clear_a0_static_clean(s);
+
     switch (aflag) {
 #ifdef TARGET_X86_64
     case MO_64:
@@ -1147,6 +1201,7 @@ static inline void gen_compute_eflags_c(DisasContext *s, TCGv reg)
    value 'b'. In the fast case, T0 is guaranted not to be used. */
 static inline void gen_jcc1_noeob(DisasContext *s, int b, TCGLabel *l1)
 {
+    bool qdmsan_skip_branch = qdmsan_prune_cmp_derived_branch(s);
     CCPrepare cc = gen_prepare_cc(s, b, s->T0);
 
     if (cc.mask != -1) {
@@ -1154,8 +1209,22 @@ static inline void gen_jcc1_noeob(DisasContext *s, int b, TCGLabel *l1)
         cc.reg = s->T0;
     }
     if (cc.use_reg2) {
+        if (qdmsan_branch_checks_enabled && !qdmsan_skip_branch) {
+            TCGv taken = tcg_temp_new();
+            tcg_gen_setcond_tl(cc.cond, taken, cc.reg, cc.reg2);
+            qdmsan_gen_value_checkpoint(s->pc_start, taken,
+                                        QDMSAN_EVENT_BRANCH);
+            tcg_temp_free(taken);
+        }
         tcg_gen_brcond_tl(cc.cond, cc.reg, cc.reg2, l1);
     } else {
+        if (qdmsan_branch_checks_enabled && !qdmsan_skip_branch) {
+            TCGv taken = tcg_temp_new();
+            tcg_gen_setcondi_tl(cc.cond, taken, cc.reg, cc.imm);
+            qdmsan_gen_value_checkpoint(s->pc_start, taken,
+                                        QDMSAN_EVENT_BRANCH);
+            tcg_temp_free(taken);
+        }
         tcg_gen_brcondi_tl(cc.cond, cc.reg, cc.imm, l1);
     }
 }
@@ -1165,6 +1234,7 @@ static inline void gen_jcc1_noeob(DisasContext *s, int b, TCGLabel *l1)
    A translation block must end soon.  */
 static inline void gen_jcc1(DisasContext *s, int b, TCGLabel *l1)
 {
+    bool qdmsan_skip_branch = qdmsan_prune_cmp_derived_branch(s);
     CCPrepare cc = gen_prepare_cc(s, b, s->T0);
 
     gen_update_cc_op(s);
@@ -1174,8 +1244,22 @@ static inline void gen_jcc1(DisasContext *s, int b, TCGLabel *l1)
     }
     set_cc_op(s, CC_OP_DYNAMIC);
     if (cc.use_reg2) {
+        if (qdmsan_branch_checks_enabled && !qdmsan_skip_branch) {
+            TCGv taken = tcg_temp_new();
+            tcg_gen_setcond_tl(cc.cond, taken, cc.reg, cc.reg2);
+            qdmsan_gen_value_checkpoint(s->pc_start, taken,
+                                        QDMSAN_EVENT_BRANCH);
+            tcg_temp_free(taken);
+        }
         tcg_gen_brcond_tl(cc.cond, cc.reg, cc.reg2, l1);
     } else {
+        if (qdmsan_branch_checks_enabled && !qdmsan_skip_branch) {
+            TCGv taken = tcg_temp_new();
+            tcg_gen_setcondi_tl(cc.cond, taken, cc.reg, cc.imm);
+            qdmsan_gen_value_checkpoint(s->pc_start, taken,
+                                        QDMSAN_EVENT_BRANCH);
+            tcg_temp_free(taken);
+        }
         tcg_gen_brcondi_tl(cc.cond, cc.reg, cc.imm, l1);
     }
 }
@@ -1455,6 +1539,10 @@ static void gen_op(DisasContext *s1, int op, MemOp ot, int d)
             afl_gen_compcov(s1->pc, s1->T0, s1->T1, ot, d == OR_EAX);
             tcg_gen_sub_tl(s1->T0, s1->T0, s1->T1);
             gen_op_st_rm_T0_A0(s1, ot, d);
+            /* QDMSAN: fill new stack frame if SUB RSP, N (d == R_ESP).
+             * cc_srcT = old RSP (saved above); cpu_regs[R_ESP] = new RSP. */
+            if (d == R_ESP)
+                qdmsan_gen_stack_alloc(cpu_regs[R_ESP], s1->cc_srcT);
         }
         gen_op_update2_cc(s1);
         set_cc_op(s1, CC_OP_SUBB + ot);
@@ -1497,10 +1585,17 @@ static void gen_op(DisasContext *s1, int op, MemOp ot, int d)
         tcg_gen_mov_tl(cpu_cc_src, s1->T1);
         tcg_gen_mov_tl(s1->cc_srcT, s1->T0);
         afl_gen_compcov(s1->pc, s1->T0, s1->T1, ot, d == OR_EAX);
+        if (s1->qdmsan_t1_static_const) {
+            qdmsan_gen_checkpoint_imm(s1->pc_start, s1->T0, s1->T1, ot);
+        } else {
+            qdmsan_gen_checkpoint(s1->pc_start, s1->T0, s1->T1, ot);
+        }
         tcg_gen_sub_tl(cpu_cc_dst, s1->T0, s1->T1);
         set_cc_op(s1, CC_OP_SUBB + ot);
+        qdmsan_mark_cc_recorded_cmp(s1);
         break;
     }
+    s1->qdmsan_t1_static_const = false;
 }
 
 /* if d == OR_TMP0, it means memory operand (address in A0) */
@@ -2072,6 +2167,20 @@ typedef struct AddressParts {
     target_long disp;
 } AddressParts;
 
+static bool qdmsan_address_parts_static_clean(AddressParts a)
+{
+    if (a.index >= 0) {
+        return false;
+    }
+
+    /*
+     * Match only machine-level forms that cannot be data-dependent UUM
+     * pointers.  Do not classify RBP-relative addresses as clean here:
+     * optimized code may use RBP as an ordinary callee-saved register.
+     */
+    return a.base == -1 || a.base == -2 || a.base == R_ESP;
+}
+
 static AddressParts gen_lea_modrm_0(CPUX86State *env, DisasContext *s,
                                     int modrm)
 {
@@ -2230,6 +2339,9 @@ static void gen_lea_modrm(CPUX86State *env, DisasContext *s, int modrm)
     AddressParts a = gen_lea_modrm_0(env, s, modrm);
     TCGv ea = gen_lea_modrm_1(s, a);
     gen_lea_v_seg(s, s->aflag, ea, a.def_seg, s->override);
+    if (qdmsan_address_parts_static_clean(a)) {
+        qdmsan_mark_a0_static_clean(s);
+    }
 }
 
 static void gen_nop_modrm(CPUX86State *env, DisasContext *s, int modrm)
@@ -2382,9 +2494,11 @@ static void gen_cmovcc1(CPUX86State *env, DisasContext *s, MemOp ot, int b,
                         int modrm, int reg)
 {
     CCPrepare cc;
+    bool qdmsan_skip_cmov;
 
     gen_ldst_modrm(env, s, modrm, ot, OR_TMP0, 0);
 
+    qdmsan_skip_cmov = qdmsan_prune_cmp_derived_branch(s);
     cc = gen_prepare_cc(s, b, s->T1);
     if (cc.mask != -1) {
         TCGv t0 = tcg_temp_new();
@@ -2397,6 +2511,9 @@ static void gen_cmovcc1(CPUX86State *env, DisasContext *s, MemOp ot, int b,
 
     tcg_gen_movcond_tl(cc.cond, s->T0, cc.reg, cc.reg2,
                        s->T0, cpu_regs[reg]);
+    if (qdmsan_branch_checks_enabled && !qdmsan_skip_cmov) {
+        qdmsan_gen_value_checkpoint(s->pc_start, s->T0, QDMSAN_EVENT_CMOV);
+    }
     gen_op_mov_reg_v(s, ot, reg, s->T0);
 
     if (cc.mask != -1) {
@@ -2490,6 +2607,7 @@ static void gen_push_v(DisasContext *s, TCGv val)
         gen_lea_v_seg(s, a_ot, s->A0, R_SS, -1);
     }
 
+    qdmsan_mark_a0_static_clean(s);
     gen_op_st_v(s, d_ot, val, s->A0);
     gen_op_mov_reg_v(s, a_ot, R_ESP, new_esp);
 }
@@ -2500,6 +2618,7 @@ static MemOp gen_pop_T0(DisasContext *s)
     MemOp d_ot = mo_pushpop(s, s->dflag);
 
     gen_lea_v_seg(s, mo_stacksize(s), cpu_regs[R_ESP], R_SS, -1);
+    qdmsan_mark_a0_static_clean(s);
     gen_op_ld_v(s, d_ot, s->T0, s->A0);
 
     return d_ot;
@@ -2513,6 +2632,7 @@ static inline void gen_pop_update(DisasContext *s, MemOp ot)
 static inline void gen_stack_A0(DisasContext *s)
 {
     gen_lea_v_seg(s, s->ss32 ? MO_32 : MO_16, cpu_regs[R_ESP], R_SS, -1);
+    qdmsan_mark_a0_static_clean(s);
 }
 
 static void gen_pusha(DisasContext *s)
@@ -3231,6 +3351,7 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                 goto illegal_op;
             }
             gen_lea_modrm(env, s, modrm);
+            qdmsan_gen_a0_ptr_checkpoint(s, QDMSAN_EVENT_STORE_PTR | 0x300);
             gen_stq_env_A0(s, offsetof(CPUX86State, fpregs[reg].mmx));
             break;
         case 0x1e7: /* movntdq */
@@ -3239,12 +3360,14 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
             if (mod == 3)
                 goto illegal_op;
             gen_lea_modrm(env, s, modrm);
+            qdmsan_gen_a0_ptr_checkpoint(s, QDMSAN_EVENT_STORE_PTR | 0x300);
             gen_sto_env_A0(s, offsetof(CPUX86State, xmm_regs[reg]));
             break;
         case 0x3f0: /* lddqu */
             if (mod == 3)
                 goto illegal_op;
             gen_lea_modrm(env, s, modrm);
+            qdmsan_gen_a0_ptr_checkpoint(s, QDMSAN_EVENT_LOAD_PTR | 0x300);
             gen_ldo_env_A0(s, offsetof(CPUX86State, xmm_regs[reg]));
             break;
         case 0x22b: /* movntss */
@@ -3698,6 +3821,19 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
                     gen_ldq_env_A0(s, offsetof(CPUX86State, xmm_t0.ZMM_Q(0)));
                 } else {
                     gen_op_ld_v(s, MO_32, s->T0, s->A0);
+                    /*
+                     * LLVM DMSan treats ordinary FPToSI/FPToUI casts as shadow
+                     * propagation, but checks x86 vector-convert intrinsics.
+                     * Optimized C casts normally lower to cvttss2si, while the
+                     * covered intrinsic boundary lowers to cvtss2si.  Recording
+                     * only the non-truncating form avoids flagging a pure cast
+                     * before its result reaches a real dangerous sink.
+                     */
+                    if (b == 0x22d) {
+                        qdmsan_gen_value_checkpoint(
+                            s->pc_start, s->T0,
+                            QDMSAN_EVENT_X86_SPECIAL | 0x20);
+                    }
                     tcg_gen_st32_tl(s->T0, cpu_env,
                                     offsetof(CPUX86State, xmm_t0.ZMM_L(0)));
                 }
@@ -4598,6 +4734,8 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
         }
         if (b == 0x2e || b == 0x2f) {
             set_cc_op(s, CC_OP_EFLAGS);
+            qdmsan_gen_ucomis_checkpoint(s->pc_start);
+            qdmsan_mark_cc_recorded_cmp(s);
         }
     }
 }
@@ -4614,6 +4752,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
     target_ulong next_eip, tval;
     int rex_w, rex_r;
     target_ulong pc_start = s->base.pc_next;
+    bool qdmsan_static_a0;
 
     s->pc_start = s->pc = pc_start;
     s->override = -1;
@@ -4841,6 +4980,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             case 2: /* OP A, Iv */
                 val = insn_get(env, s, ot);
                 tcg_gen_movi_tl(s->T1, val);
+                s->qdmsan_t1_static_const = op == OP_CMPL;
                 gen_op(s, op, ot, OR_EAX);
                 break;
             }
@@ -4887,6 +5027,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 break;
             }
             tcg_gen_movi_tl(s->T1, val);
+            s->qdmsan_t1_static_const = op == OP_CMPL;
             gen_op(s, op, ot, opreg);
         }
         break;
@@ -4927,6 +5068,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         case 0: /* test */
             val = insn_get(env, s, ot);
             tcg_gen_movi_tl(s->T1, val);
+            qdmsan_gen_and_checkpoint_imm(s->pc_start, s->T0, s->T1, ot);
             gen_op_testl_T0_T1_cc(s);
             set_cc_op(s, CC_OP_LOGICB + ot);
             break;
@@ -5091,6 +5233,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             break;
         case 6: /* div */
+            qdmsan_gen_value_checkpoint(s->pc_start, s->T0, QDMSAN_EVENT_DIV);
             switch(ot) {
             case MO_8:
                 gen_helper_divb_AL(cpu_env, s->T0);
@@ -5110,6 +5253,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             break;
         case 7: /* idiv */
+            qdmsan_gen_value_checkpoint(s->pc_start, s->T0, QDMSAN_EVENT_DIV);
             switch(ot) {
             case MO_8:
                 gen_helper_idivb_AL(cpu_env, s->T0);
@@ -5186,19 +5330,31 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             next_eip = s->pc - s->cs_base;
             if (__afl_cmp_map && afl_must_instrument(next_eip))
               gen_helper_afl_cmplog_rtn(cpu_env);
+            if (use_qdmsan && qdmsan_max_call_stack)
+              gen_helper_qdmsan_shadow_stack_push(tcg_const_tl(s->pc));
             if (use_qasan && qasan_max_call_stack)
               gen_helper_qasan_shadow_stack_push(tcg_const_tl(s->pc));
             tcg_gen_movi_tl(s->T1, next_eip);
+            /* QDMSAN: fill red zone before callee entry (x86-64 only) */
+            qdmsan_gen_call_fill(cpu_regs[R_ESP]);
             gen_push_v(s, s->T1);
+            qdmsan_gen_value_checkpoint(s->pc_start, s->T0,
+                                        QDMSAN_EVENT_INDIRECT);
             gen_op_jmp_v(s->T0);
             gen_bnd_jmp(s);
             gen_jr(s, s->T0);
             break;
         case 3: /* lcall Ev */
+            qdmsan_static_a0 = qdmsan_peek_a0_static_clean(s);
             gen_op_ld_v(s, ot, s->T1, s->A0);
             gen_add_A0_im(s, 1 << ot);
+            if (qdmsan_static_a0) {
+                qdmsan_mark_a0_static_clean(s);
+            }
             gen_op_ld_v(s, MO_16, s->T0, s->A0);
         do_lcall:
+            if (use_qdmsan && qdmsan_max_call_stack)
+              gen_helper_qdmsan_shadow_stack_push(tcg_const_tl(s->pc));
             if (use_qasan && qasan_max_call_stack)
               gen_helper_qasan_shadow_stack_push(tcg_const_tl(s->pc));
             if (s->pe && !s->vm86) {
@@ -5219,13 +5375,19 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             if (dflag == MO_16) {
                 tcg_gen_ext16u_tl(s->T0, s->T0);
             }
+            qdmsan_gen_value_checkpoint(s->pc_start, s->T0,
+                                        QDMSAN_EVENT_INDIRECT);
             gen_op_jmp_v(s->T0);
             gen_bnd_jmp(s);
             gen_jr(s, s->T0);
             break;
         case 5: /* ljmp Ev */
+            qdmsan_static_a0 = qdmsan_peek_a0_static_clean(s);
             gen_op_ld_v(s, ot, s->T1, s->A0);
             gen_add_A0_im(s, 1 << ot);
+            if (qdmsan_static_a0) {
+                qdmsan_mark_a0_static_clean(s);
+            }
             gen_op_ld_v(s, MO_16, s->T0, s->A0);
         do_ljmp:
             if (s->pe && !s->vm86) {
@@ -5256,6 +5418,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 
         gen_ldst_modrm(env, s, modrm, ot, OR_TMP0, 0);
         gen_op_mov_v_reg(s, ot, s->T1, reg);
+        qdmsan_gen_and_checkpoint(s->pc_start, s->T0, s->T1, ot);
         gen_op_testl_T0_T1_cc(s);
         set_cc_op(s, CC_OP_LOGICB + ot);
         break;
@@ -5267,6 +5430,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
 
         gen_op_mov_v_reg(s, ot, s->T0, OR_EAX);
         tcg_gen_movi_tl(s->T1, val);
+        qdmsan_gen_and_checkpoint_imm(s->pc_start, s->T0, s->T1, ot);
         gen_op_testl_T0_T1_cc(s);
         set_cc_op(s, CC_OP_LOGICB + ot);
         break;
@@ -5415,12 +5579,17 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             cmpv = tcg_temp_new();
             gen_op_mov_v_reg(s, ot, newv, reg);
             tcg_gen_mov_tl(cmpv, cpu_regs[R_EAX]);
+            qdmsan_gen_value_checkpoint(s->pc_start, cmpv,
+                                        QDMSAN_EVENT_ATOMIC);
+            qdmsan_gen_value_checkpoint(s->pc_start, newv,
+                                        QDMSAN_EVENT_ATOMIC | 0x100);
 
             if (s->prefix & PREFIX_LOCK) {
                 if (mod == 3) {
                     goto illegal_op;
                 }
                 gen_lea_modrm(env, s, modrm);
+                qdmsan_gen_a0_ptr_checkpoint(s, QDMSAN_EVENT_ATOMIC | 0x200);
                 tcg_gen_atomic_cmpxchg_tl(oldv, s->A0, cmpv, newv,
                                           s->mem_index, ot | MO_LE);
                 gen_op_mov_reg_v(s, ot, R_EAX, oldv);
@@ -5774,6 +5943,7 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             tcg_gen_movi_tl(s->A0, offset_addr);
             gen_add_A0_ds_seg(s);
+            qdmsan_mark_a0_static_clean(s);
             if ((b & 2) == 0) {
                 gen_op_ld_v(s, ot, s->T0, s->A0);
                 gen_op_mov_reg_v(s, ot, R_EAX, s->T0);
@@ -5869,8 +6039,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         if (mod == 3)
             goto illegal_op;
         gen_lea_modrm(env, s, modrm);
+        qdmsan_static_a0 = qdmsan_peek_a0_static_clean(s);
         gen_op_ld_v(s, ot, s->T1, s->A0);
         gen_add_A0_im(s, 1 << ot);
+        if (qdmsan_static_a0) {
+            qdmsan_mark_a0_static_clean(s);
+        }
         /* load the segment first to handle exceptions properly */
         gen_op_ld_v(s, MO_16, s->T0, s->A0);
         gen_movl_seg_T0(s, op);
@@ -6645,9 +6819,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         val = x86_ldsw_code(env, s);
         ot = gen_pop_T0(s);
         gen_stack_update(s, val + (1 << ot));
+        if (use_qdmsan && qdmsan_max_call_stack)
+          gen_helper_qdmsan_shadow_stack_pop(s->T0);
         if (use_qasan && qasan_max_call_stack)
           gen_helper_qasan_shadow_stack_pop(s->T0);
         /* Note that gen_pop_T0 uses a zero-extending load.  */
+        qdmsan_gen_value_checkpoint(s->pc_start, s->T0, QDMSAN_EVENT_INDIRECT);
         gen_op_jmp_v(s->T0);
         gen_bnd_jmp(s);
         gen_jr(s, s->T0);
@@ -6655,9 +6832,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
     case 0xc3: /* ret */
         ot = gen_pop_T0(s);
         gen_pop_update(s, ot);
+        if (use_qdmsan && qdmsan_max_call_stack)
+          gen_helper_qdmsan_shadow_stack_pop(s->T0);
         if (use_qasan && qasan_max_call_stack)
           gen_helper_qasan_shadow_stack_pop(s->T0);
         /* Note that gen_pop_T0 uses a zero-extending load.  */
+        qdmsan_gen_value_checkpoint(s->pc_start, s->T0, QDMSAN_EVENT_INDIRECT);
         gen_op_jmp_v(s->T0);
         gen_bnd_jmp(s);
         gen_jr(s, s->T0);
@@ -6674,14 +6854,22 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
         } else {
             gen_stack_A0(s);
             /* pop offset */
+            qdmsan_static_a0 = qdmsan_peek_a0_static_clean(s);
             gen_op_ld_v(s, dflag, s->T0, s->A0);
+            if (use_qdmsan && qdmsan_max_call_stack)
+              gen_helper_qdmsan_shadow_stack_pop(s->T0);
             if (use_qasan && qasan_max_call_stack)
               gen_helper_qasan_shadow_stack_pop(s->T0);
             /* NOTE: keeping EIP updated is not a problem in case of
                exception */
+            qdmsan_gen_value_checkpoint(s->pc_start, s->T0,
+                                        QDMSAN_EVENT_INDIRECT);
             gen_op_jmp_v(s->T0);
             /* pop selector */
             gen_add_A0_im(s, 1 << dflag);
+            if (qdmsan_static_a0) {
+                qdmsan_mark_a0_static_clean(s);
+            }
             gen_op_ld_v(s, dflag, s->T0, s->A0);
             gen_op_movl_seg_T0_vm(s, R_CS);
             /* add stack offset */
@@ -6722,6 +6910,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             next_eip = s->pc - s->cs_base;
             if (__afl_cmp_map && afl_must_instrument(next_eip))
               gen_helper_afl_cmplog_rtn(cpu_env);
+            if (use_qdmsan && qdmsan_max_call_stack)
+              gen_helper_qdmsan_shadow_stack_push(tcg_const_tl(s->pc));
             if (use_qasan && qasan_max_call_stack)
               gen_helper_qasan_shadow_stack_push(tcg_const_tl(s->pc));
             tval += next_eip;
@@ -6731,6 +6921,8 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
                 tval &= 0xffffffff;
             }
             tcg_gen_movi_tl(s->T0, next_eip);
+            /* QDMSAN: fill red zone before callee entry (x86-64 only) */
+            qdmsan_gen_call_fill(cpu_regs[R_ESP]);
             gen_push_v(s, s->T0);
             gen_bnd_jmp(s);
             gen_jmp(s, tval);
@@ -7496,8 +7688,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_lea_modrm(env, s, modrm);
             tcg_gen_ld32u_tl(s->T0,
                              cpu_env, offsetof(CPUX86State, gdt.limit));
+            qdmsan_static_a0 = qdmsan_peek_a0_static_clean(s);
             gen_op_st_v(s, MO_16, s->T0, s->A0);
             gen_add_A0_im(s, 2);
+            if (qdmsan_static_a0) {
+                qdmsan_mark_a0_static_clean(s);
+            }
             tcg_gen_ld_tl(s->T0, cpu_env, offsetof(CPUX86State, gdt.base));
             if (dflag == MO_16) {
                 tcg_gen_andi_tl(s->T0, s->T0, 0xffffff);
@@ -7551,8 +7747,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             gen_svm_check_intercept(s, pc_start, SVM_EXIT_IDTR_READ);
             gen_lea_modrm(env, s, modrm);
             tcg_gen_ld32u_tl(s->T0, cpu_env, offsetof(CPUX86State, idt.limit));
+            qdmsan_static_a0 = qdmsan_peek_a0_static_clean(s);
             gen_op_st_v(s, MO_16, s->T0, s->A0);
             gen_add_A0_im(s, 2);
+            if (qdmsan_static_a0) {
+                qdmsan_mark_a0_static_clean(s);
+            }
             tcg_gen_ld_tl(s->T0, cpu_env, offsetof(CPUX86State, idt.base));
             if (dflag == MO_16) {
                 tcg_gen_andi_tl(s->T0, s->T0, 0xffffff);
@@ -7701,8 +7901,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             gen_svm_check_intercept(s, pc_start, SVM_EXIT_GDTR_WRITE);
             gen_lea_modrm(env, s, modrm);
+            qdmsan_static_a0 = qdmsan_peek_a0_static_clean(s);
             gen_op_ld_v(s, MO_16, s->T1, s->A0);
             gen_add_A0_im(s, 2);
+            if (qdmsan_static_a0) {
+                qdmsan_mark_a0_static_clean(s);
+            }
             gen_op_ld_v(s, CODE64(s) + MO_32, s->T0, s->A0);
             if (dflag == MO_16) {
                 tcg_gen_andi_tl(s->T0, s->T0, 0xffffff);
@@ -7718,8 +7922,12 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             gen_svm_check_intercept(s, pc_start, SVM_EXIT_IDTR_WRITE);
             gen_lea_modrm(env, s, modrm);
+            qdmsan_static_a0 = qdmsan_peek_a0_static_clean(s);
             gen_op_ld_v(s, MO_16, s->T1, s->A0);
             gen_add_A0_im(s, 2);
+            if (qdmsan_static_a0) {
+                qdmsan_mark_a0_static_clean(s);
+            }
             gen_op_ld_v(s, CODE64(s) + MO_32, s->T0, s->A0);
             if (dflag == MO_16) {
                 tcg_gen_andi_tl(s->T0, s->T0, 0xffffff);
@@ -8295,6 +8503,9 @@ static target_ulong disas_insn(DisasContext *s, CPUState *cpu)
             }
             gen_lea_modrm(env, s, modrm);
             tcg_gen_qemu_ld_i32(s->tmp2_i32, s->A0, s->mem_index, MO_LEUL);
+            tcg_gen_extu_i32_tl(s->T0, s->tmp2_i32);
+            qdmsan_gen_value_checkpoint(s->pc_start, s->T0,
+                                         QDMSAN_EVENT_X86_SPECIAL | 0x10);
             gen_helper_ldmxcsr(cpu_env, s->tmp2_i32);
             break;
 
@@ -8620,6 +8831,9 @@ static void i386_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->tf = (flags >> TF_SHIFT) & 1;
     dc->cc_op = CC_OP_DYNAMIC;
     dc->cc_op_dirty = false;
+    dc->qdmsan_a0_static_clean = false;
+    dc->qdmsan_cc_recorded_cmp = false;
+    dc->qdmsan_t1_static_const = false;
     dc->cs_base = cs_base;
     dc->popl_esp_hack = 0;
     /* select memory access functions */
@@ -8679,6 +8893,7 @@ static void i386_tr_insn_start(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
 
+    dc->qdmsan_a0_static_clean = false;
     tcg_gen_insn_start(dc->base.pc_next, dc->cc_op);
 }
 

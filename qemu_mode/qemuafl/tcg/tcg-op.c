@@ -51,6 +51,22 @@ GEN_QASAN_OP(store2)
 GEN_QASAN_OP(store4)
 GEN_QASAN_OP(store8)
 
+/* Unlike QASan, QDMSAN does not consult a byte shadow here.  The runtime
+ * helper first checks a sparse allocation-region registry and returns
+ * immediately for the overwhelmingly common unregistered access. */
+static inline void qdmsan_gen_access(TCGv addr, unsigned size, bool is_store)
+{
+    /* Translation-time gate: with the heap planes off no helper call is
+     * emitted, so ordinary loads and stores pay nothing. */
+    if (use_qdmsan && qdmsan_heap_planes_enabled) {
+        TCGv size_v = tcg_const_tl(size);
+        TCGv store_v = tcg_const_tl(is_store);
+        gen_helper_qdmsan_access(cpu_env, addr, size_v, store_v);
+        tcg_temp_free(store_v);
+        tcg_temp_free(size_v);
+    }
+}
+
 /* Reduce the number of ifdefs below.  This assumes that all uses of
    TCGV_HIGH and TCGV_LOW are properly protected by a conditional that
    the compiler can eliminate.  */
@@ -2858,6 +2874,8 @@ void tcg_gen_qemu_ld_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
 
     addr = plugin_prep_mem_callbacks(addr);
 
+    qdmsan_gen_access(addr, memop_size(memop), false);
+
     switch (memop & MO_SIZE) {
         case MO_64: qasan_gen_load8(addr, idx); break;
         case MO_32: qasan_gen_load4(addr, idx); break;
@@ -2914,6 +2932,8 @@ void tcg_gen_qemu_st_i32(TCGv_i32 val, TCGv addr, TCGArg idx, MemOp memop)
 
     addr = plugin_prep_mem_callbacks(addr);
 
+    qdmsan_gen_access(addr, memop_size(memop), true);
+
     switch (memop & MO_SIZE) {
         case MO_64: qasan_gen_store8(addr, idx); break;
         case MO_32: qasan_gen_store4(addr, idx); break;
@@ -2964,6 +2984,8 @@ void tcg_gen_qemu_ld_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
     }
 
     addr = plugin_prep_mem_callbacks(addr);
+
+    qdmsan_gen_access(addr, memop_size(memop), false);
 
     switch (memop & MO_SIZE) {
         case MO_64: qasan_gen_load8(addr, idx); break;
@@ -3036,6 +3058,8 @@ void tcg_gen_qemu_st_i64(TCGv_i64 val, TCGv addr, TCGArg idx, MemOp memop)
     }
 
     addr = plugin_prep_mem_callbacks(addr);
+
+    qdmsan_gen_access(addr, memop_size(memop), true);
 
     switch (memop & MO_SIZE) {
         case MO_64: qasan_gen_store8(addr, idx); break;
